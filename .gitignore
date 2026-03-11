@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Sanal ortam (paylaşılmaz)
+bin/
+lib/
+lib64/
+include/
+share/
+pyvenv.cfg
+pip-selfcheck.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Güvenlik — ASLA commit edilmemeli
+*.key
+*.pem
+secrets.json
+.env
+private_keys.txt
+
+# OS
+.DS_Store
+Thumbs.db
