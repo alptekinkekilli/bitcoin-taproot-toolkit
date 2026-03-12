@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Taproot Wallet</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+</head>
+<body>
+  <div class="app">
+
+    <!-- Sidebar -->
+    <nav class="sidebar">
+      <div class="sidebar-logo">
+        <span class="logo-icon">⚡</span>
+        <span class="logo-text">Taproot</span>
+        <span class="network-badge" id="networkBadge">testnet</span>
+      </div>
+      <ul class="nav-list">
+        <li class="nav-item active" data-tab="dashboard">
+          <span class="nav-icon">◈</span><span>Dashboard</span>
+        </li>
+        <li class="nav-item" data-tab="receive">
+          <span class="nav-icon">↓</span><span>Al</span>
+        </li>
+        <li class="nav-item" data-tab="send">
+          <span class="nav-icon">↑</span><span>Gönder</span>
+        </li>
+        <li class="nav-item" data-tab="transactions">
+          <span class="nav-icon">≡</span><span>İşlemler</span>
+        </li>
+        <li class="nav-item" data-tab="musig2">
+          <span class="nav-icon">⊕</span><span>MuSig2</span>
+        </li>
+        <li class="nav-item" data-tab="wallets">
+          <span class="nav-icon">◻</span><span>Cüzdanlar</span>
+        </li>
+      </ul>
+      <div class="sidebar-footer">
+        <div class="refresh-status">
+          <span class="pulse" id="refreshDot"></span>
+          <span id="lastRefresh">—</span>
+        </div>
+      </div>
+    </nav>
+
+    <!-- Main Content -->
+    <main class="main">
+
+      <!-- ── DASHBOARD ── -->
+      <div class="tab active" id="tab-dashboard">
+        <div class="page-header">
+          <h1>Dashboard</h1>
+          <button class="btn btn-ghost" onclick="refreshAll()">↺ Yenile</button>
+        </div>
+        <div class="stats-grid" id="statsGrid">
+          <div class="stat-card">
+            <div class="stat-label">Toplam Bakiye</div>
+            <div class="stat-value" id="totalBalance">— sat</div>
+            <div class="stat-sub" id="totalBalanceBtc">—</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Onaylanmış</div>
+            <div class="stat-value" id="confirmedBalance">— sat</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Bekleyen</div>
+            <div class="stat-value" id="unconfirmedBalance">— sat</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">Cüzdan Sayısı</div>
+            <div class="stat-value" id="walletCount">—</div>
+          </div>
+        </div>
+        <div class="section-header">
+          <h2>Adresler</h2>
+          <button class="btn btn-primary" onclick="showTab('wallets')">+ Yeni Cüzdan</button>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead><tr>
+              <th>Etiket</th><th>Adres</th><th>Bakiye</th><th>UTXO</th><th></th>
+            </tr></thead>
+            <tbody id="dashboardWalletTable"><tr><td colspan="5" class="empty">Cüzdan yok</td></tr></tbody>
+          </table>
+        </div>
+        <div class="section-header"><h2>Son İşlemler</h2></div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead><tr><th>TXID</th><th>Blok</th><th>Durum</th><th></th></tr></thead>
+            <tbody id="recentTxTable"><tr><td colspan="4" class="empty">İşlem yok</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- ── RECEIVE ── -->
+      <div class="tab" id="tab-receive">
+        <div class="page-header"><h1>Bitcoin Al</h1></div>
+        <div class="card receive-card">
+          <label class="form-label">Adres Seç</label>
+          <select class="form-select" id="receiveWalletSelect" onchange="updateReceive()">
+            <option value="">— Cüzdan seçin —</option>
+          </select>
+          <div class="qr-wrap" id="qrWrap"></div>
+          <div class="address-display" id="receiveAddress">
+            <span class="placeholder">Cüzdan seçin</span>
+          </div>
+          <div class="action-row">
+            <button class="btn btn-primary" onclick="copyReceiveAddress()">⎘ Kopyala</button>
+            <button class="btn btn-ghost" onclick="refreshReceive()">↺ Bakiye Kontrol</button>
+          </div>
+          <div class="balance-row" id="receiveBalance"></div>
+        </div>
+      </div>
+
+      <!-- ── SEND ── -->
+      <div class="tab" id="tab-send">
+        <div class="page-header"><h1>Bitcoin Gönder</h1></div>
+        <div class="card">
+          <div class="form-grid">
+            <div class="form-group">
+              <label class="form-label">Gönderen Adres</label>
+              <select class="form-select" id="sendFromSelect" onchange="updateSendBalance()">
+                <option value="">— Cüzdan seçin —</option>
+              </select>
+              <div class="form-hint" id="sendFromBalance"></div>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Alıcı Adres (tb1p... / bc1p...)</label>
+              <input class="form-input" id="sendToAddr" placeholder="tb1p...">
+            </div>
+            <div class="form-group">
+              <label class="form-label">Miktar (sat)</label>
+              <input class="form-input" id="sendAmount" type="number" placeholder="1000" min="546">
+              <div class="form-hint" id="sendAmountBtc"></div>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Ücret (sat)</label>
+              <input class="form-input" id="sendFee" type="number" value="500" min="100">
+            </div>
+          </div>
+          <div class="action-row">
+            <button class="btn btn-primary" onclick="buildTx()">Transaction Oluştur</button>
+          </div>
+        </div>
+
+        <!-- TX Preview -->
+        <div class="card" id="txPreview" style="display:none">
+          <h3>Transaction Önizleme</h3>
+          <div class="tx-detail-grid">
+            <div class="tx-detail-row"><span>Boyut</span><span id="txSize">—</span></div>
+            <div class="tx-detail-row"><span>Ücret</span><span id="txFee">—</span></div>
+            <div class="tx-detail-row"><span>Para Üstü</span><span id="txChange">—</span></div>
+            <div class="tx-detail-row"><span>İmza</span><span id="txSig" class="mono-sm">—</span></div>
+          </div>
+          <label class="form-label">Ham TX (hex)</label>
+          <textarea class="form-textarea mono-sm" id="txHex" readonly rows="4"></textarea>
+          <div class="action-row">
+            <button class="btn btn-orange" onclick="broadcastTx()">⚡ Yayınla</button>
+            <button class="btn btn-ghost" onclick="copyTxHex()">⎘ Hex Kopyala</button>
+          </div>
+          <div id="broadcastResult" class="broadcast-result"></div>
+        </div>
+      </div>
+
+      <!-- ── TRANSACTIONS ── -->
+      <div class="tab" id="tab-transactions">
+        <div class="page-header">
+          <h1>İşlemler</h1>
+          <div class="header-actions">
+            <select class="form-select sm" id="txFilterWallet" onchange="loadTxHistory()">
+              <option value="">Tüm Cüzdanlar</option>
+            </select>
+            <button class="btn btn-ghost" onclick="loadTxHistory()">↺</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead><tr>
+              <th>TXID</th><th>Tarih</th><th>Blok</th><th>Tutar</th><th>Durum</th><th></th>
+            </tr></thead>
+            <tbody id="txHistoryTable"><tr><td colspan="6" class="empty">İşlem yok</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- ── MUSIG2 ── -->
+      <div class="tab" id="tab-musig2">
+        <div class="page-header">
+          <h1>MuSig2 Multisig</h1>
+          <button class="btn btn-primary" onclick="openMusig2Modal()">+ Yeni Oturum</button>
+        </div>
+
+        <!-- Session List -->
+        <div id="musig2SessionList">
+          <div class="empty-state">Henüz MuSig2 oturumu yok.<br>Yeni bir oturum oluşturun.</div>
+        </div>
+      </div>
+
+      <!-- ── WALLETS ── -->
+      <div class="tab" id="tab-wallets">
+        <div class="page-header">
+          <h1>Cüzdan Yönetimi</h1>
+          <button class="btn btn-primary" onclick="openNewWalletModal()">+ Yeni Cüzdan</button>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead><tr>
+              <th>Etiket</th><th>Ağ</th><th>Adres</th><th>x-only Pubkey</th><th></th>
+            </tr></thead>
+            <tbody id="walletsTable"><tr><td colspan="5" class="empty">Cüzdan yok</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+
+    </main>
+  </div>
+
+  <!-- ── MODALS ── -->
+
+  <!-- New Wallet Modal -->
+  <div class="modal-overlay" id="newWalletModal">
+    <div class="modal">
+      <div class="modal-header"><h3>Yeni Cüzdan Oluştur</h3><button class="modal-close" onclick="closeModal('newWalletModal')">✕</button></div>
+      <div class="form-group"><label class="form-label">Etiket</label><input class="form-input" id="newWalletLabel" placeholder="Ana Cüzdan"></div>
+      <div class="form-group"><label class="form-label">Ağ</label>
+        <select class="form-select" id="newWalletNetwork"><option value="testnet">Testnet</option><option value="mainnet">Mainnet</option></select>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" onclick="closeModal('newWalletModal')">İptal</button>
+        <button class="btn btn-primary" onclick="createWallet()">Oluştur</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- New MuSig2 Modal -->
+  <div class="modal-overlay" id="newMusig2Modal">
+    <div class="modal">
+      <div class="modal-header"><h3>MuSig2 Oturumu Oluştur</h3><button class="modal-close" onclick="closeModal('newMusig2Modal')">✕</button></div>
+      <div class="form-group"><label class="form-label">Etiket</label><input class="form-input" id="musig2Label" placeholder="2-of-2 Multisig"></div>
+      <div class="form-group"><label class="form-label">Katılımcı Sayısı (N)</label>
+        <input class="form-input" id="musig2N" type="number" value="2" min="2" max="10">
+      </div>
+      <div class="form-group"><label class="form-label">Ağ</label>
+        <select class="form-select" id="musig2Network"><option value="testnet">Testnet</option><option value="mainnet">Mainnet</option></select>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" onclick="closeModal('newMusig2Modal')">İptal</button>
+        <button class="btn btn-primary" onclick="createMusig2Session()">Oluştur</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MuSig2 Sign Modal -->
+  <div class="modal-overlay" id="musig2SignModal">
+    <div class="modal modal-lg">
+      <div class="modal-header"><h3>MuSig2 İmzala & Yayınla</h3><button class="modal-close" onclick="closeModal('musig2SignModal')">✕</button></div>
+      <div class="form-group"><label class="form-label">Alıcı Adres</label><input class="form-input" id="musig2ToAddr" placeholder="tb1p..."></div>
+      <div class="form-group"><label class="form-label">Miktar (sat)</label><input class="form-input" id="musig2Amount" type="number" placeholder="1000"></div>
+      <div class="form-group"><label class="form-label">Ücret (sat)</label><input class="form-input" id="musig2Fee" type="number" value="500"></div>
+      <div id="musig2SignResult" style="display:none">
+        <div class="tx-detail-grid">
+          <div class="tx-detail-row"><span>İmza Geçerli</span><span id="musig2SigValid">—</span></div>
+          <div class="tx-detail-row"><span>Sighash</span><span id="musig2Sighash" class="mono-sm">—</span></div>
+          <div class="tx-detail-row"><span>Final İmza</span><span id="musig2FinalSig" class="mono-sm">—</span></div>
+        </div>
+        <label class="form-label">Ham TX</label>
+        <textarea class="form-textarea mono-sm" id="musig2TxHex" readonly rows="3"></textarea>
+      </div>
+      <div id="musig2BroadcastResult" class="broadcast-result"></div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" onclick="closeModal('musig2SignModal')">İptal</button>
+        <button class="btn btn-orange" id="musig2SignBtn" onclick="musig2SignAndBroadcast()">İmzala & Yayınla</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
