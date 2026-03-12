@@ -176,12 +176,16 @@ def create_wallet(req: WalletCreate):
     # Bitcoin Core v26+ entegrasyonu: descriptor olarak kaydet
     core_import_result = None
     if _core_rpc:
+        import time as _time
         try:
             core_import_result = DescriptorWallet.import_taproot_key(
                 rpc=_core_rpc,
                 xonly_hex=xonly_pk.hex(),
                 label=req.label,
-                timestamp=0,   # genesis'ten tara (yavaş ama güvenli)
+                # Yeni üretilen anahtar → şu anki zaman.
+                # timestamp=0 genesis'ten tarar, mainnet'te saatler sürer.
+                # Geçmişte alınmış işlemleri görmek için eski tarih ver.
+                timestamp=int(_time.time()),
             )
         except LegacyMethodError as e:
             # Bu branch teorik — import_taproot_key zaten importdescriptors kullanır
@@ -421,7 +425,7 @@ def core_status():
         }
 
     try:
-        info   = _core_rpc.get_blockchain_info()
+        info   = _core_rpc.health_check()          # getblockchaininfo
         net    = _core_rpc.get_network_info()
         mem    = _core_rpc.get_mempool_info()
         fee    = _core_rpc.estimate_smart_fee(conf_target=6)

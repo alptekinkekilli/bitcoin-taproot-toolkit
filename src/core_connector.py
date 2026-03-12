@@ -178,7 +178,7 @@ class CoreConnector:
         rpchost: str = "127.0.0.1",
         rpcport: Optional[int] = None,
         wallet_name: Optional[str] = None,
-        timeout_sec: int = 30,
+        timeout_sec: int = 15,
     ):
         if network not in NETWORK_CONFIG:
             raise ValueError(f"Geçersiz ağ: {network}. Seçenekler: {list(NETWORK_CONFIG)}")

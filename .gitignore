@@ -25,6 +25,7 @@ pip-selfcheck.json
 *.pem
 secrets.json
 .env
+.env.mainnet
 private_keys.txt
 
 # OS
