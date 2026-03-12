@@ -116,6 +116,51 @@ def _lift_x(xb: bytes) -> Point:
         raise ValueError("Geçersiz x koordinatı")
     return Point(x, y if y % 2 == 0 else P - y)
 
+def schnorr_verify(msg: bytes, xonly_pk: bytes, sig: bytes) -> bool:
+    """
+    BIP-340 §Verification — Schnorr imza doğrulama.
+
+    Algoritma:
+        P  = lift_x(xonly_pk)                    secp256k1 noktasına dönüştür
+        r  = int(sig[:32])                        R.x bileşeni
+        s  = int(sig[32:])                        s skaleri
+        e  = H("BIP0340/challenge", r ‖ P.x ‖ msg) mod N
+        R  = s·G − e·P
+        Geçerli: R is not infinity, R.y çift, R.x == r
+
+    Neden 'lift_x' (x-only)?
+        BIP-340 Taproot'ta açık anahtarlar yalnızca x koordinatını saklar.
+        Çift y varsayılır. lift_x, x'ten çift y'li noktayı üretir.
+
+    Argümanlar:
+        msg      : 32-byte mesaj (TapSighash veya başka)
+        xonly_pk : 32-byte x-only public key
+        sig      : 64-byte Schnorr imzası (R.x ‖ s)
+
+    Döner:
+        True = geçerli, False = geçersiz
+    """
+    if len(sig) != 64 or len(xonly_pk) != 32 or len(msg) != 32:
+        return False
+    try:
+        Q = _lift_x(xonly_pk)          # Public key noktası (P ile karışmasın)
+        r = int.from_bytes(sig[:32], "big")
+        s = int.from_bytes(sig[32:], "big")
+        if r >= P or s >= N:           # P burada secp256k1 field prime (modül seviyesi)
+            return False
+        e = int.from_bytes(
+            _tagged_hash("BIP0340/challenge",
+                         sig[:32] + xonly_pk + msg), "big") % N
+        # R = s·G - e·Q  (Q.y negasyonu: secp256k1 field prime P ile)
+        neg_Q = Point(Q.x, (-Q.y) % P)
+        R = _point_add(_point_mul(s, G), _point_mul(e, neg_Q))
+        if R.is_infinity or R.y % 2 != 0 or R.x != r:
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def schnorr_sign(msg: bytes, sk: bytes) -> bytes:
     """
     BIP-340 §Signing — deterministik Schnorr imzası.
