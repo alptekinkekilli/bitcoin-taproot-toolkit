@@ -226,6 +226,20 @@ class TaprootSigner:
                 locktime=locktime,
             )
             sig = schnorr_sign(sighash, sk)
+
+            # BIP-340 §Verification — imzayı hemen doğrula
+            # Bu adım olmadan yanlış imza sessizce yayına girer.
+            # xonly_pubkey: scriptPubKey'in son 32 byte'ı (0x51 0x20 <xonly>)
+            xonly_pk = raw_inputs[idx].scriptpubkey[2:]
+            from raw_tx import schnorr_verify
+            if not schnorr_verify(sighash, xonly_pk, sig):
+                raise ValueError(
+                    f"Girdi {idx}: Schnorr imza doğrulaması başarısız.\n"
+                    f"  sighash : {sighash.hex()}\n"
+                    f"  xonly_pk: {xonly_pk.hex()}\n"
+                    f"  sig     : {sig.hex()}"
+                )
+
             witness_sig = SighashType.serialize_witness_sig(sig, self.sighash_type)
             witnesses.append(witness_sig)
 

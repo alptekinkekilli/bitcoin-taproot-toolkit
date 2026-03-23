@@ -378,27 +378,53 @@ def taproot_sighash(
         for o in outputs
     )).digest()
 
-    inp = inputs[input_index]
+    # ── BIP-341 §Common signature message ────────────────────────────────────
+    #
+    # ANYONECANPAY (0x80) olmayan durumda (SIGHASH_DEFAULT = 0x00):
+    #   Per-input alanlar (outpoint, amount, scriptPubKey, nSequence) EKLENMEZ.
+    #   Bu veriler sha_prevouts / sha_amounts / sha_scriptpubkeys / sha_sequences
+    #   toplu hash'lerinde zaten taahhüt edilmiştir.
+    #   "Data about this input" bloğu yalnızca: spend_type + input_index (4B LE)
+    #
+    # ANYONECANPAY durumunda (hash_type & 0x80):
+    #   sha_* alanları yoktur; bunun yerine bu girdinin outpoint/amount/spk/seq
+    #   doğrudan mesaja eklenir.
+    #
+    # Kaynak: BIP-341 §Common signature message
+    #   https://github.com/bitcoin/bips/blob/master/bip-0341.mediawiki
 
-    # Epoch + hash_type + version + locktime + sha'lar
-    msg = (
-        bytes([0x00]) +                        # epoch
-        bytes([sighash_type]) +                # hash_type
-        le32(version) +
-        le32(locktime) +
-        sha_prevouts +
-        sha_amounts +
-        sha_scriptpubkeys +
-        sha_sequences +
-        sha_outputs +
-        bytes([0x00]) +                        # spend_type = key-path, no annex
-        bytes.fromhex(inp.txid)[::-1] +
-        struct.pack("<I", inp.vout) +
-        le64(inp.value_sat) +
-        varint(len(inp.scriptpubkey)) + inp.scriptpubkey +
-        struct.pack("<I", 0xFFFFFFFD) +        # nSequence
-        struct.pack("<I", input_index)         # input_index
-    )
+    is_anyonecanpay = bool(sighash_type & 0x80)
+    base_type = sighash_type & 0x03  # ALL=0x01/DEFAULT=0x00, NONE=0x02, SINGLE=0x03
+
+    msg = bytes([0x00])              # epoch
+    msg += bytes([sighash_type])     # hash_type
+    msg += le32(version)
+    msg += le32(locktime)
+
+    if not is_anyonecanpay:
+        # Tüm girdi outpoints, tutarlar, scriptler, sequence'lar toplu hash'te
+        msg += sha_prevouts
+        msg += sha_amounts
+        msg += sha_scriptpubkeys
+        msg += sha_sequences
+
+    if base_type not in (0x02,):     # SIGHASH_NONE değilse çıktılar eklenir
+        msg += sha_outputs
+
+    msg += bytes([0x00])             # spend_type: key-path spend, annex yok
+
+    if is_anyonecanpay:
+        # ANYONECANPAY: bu girdinin alanları doğrudan mesaja girer
+        inp = inputs[input_index]
+        msg += bytes.fromhex(inp.txid)[::-1]           # outpoint txid (32B LE)
+        msg += struct.pack("<I", inp.vout)              # outpoint vout (4B LE)
+        msg += le64(inp.value_sat)                      # amount (8B LE)
+        msg += varint(len(inp.scriptpubkey)) + inp.scriptpubkey  # scriptPubKey
+        msg += struct.pack("<I", 0xFFFFFFFD)            # nSequence (RBF)
+    else:
+        # Normal (non-ANYONECANPAY): yalnızca girdi indeksi
+        msg += struct.pack("<I", input_index)           # input_index (4B LE)
+
     return _tagged_hash("TapSighash", msg)
 
 
@@ -483,7 +509,7 @@ def build_tx(
 
 # ── Testnet API ───────────────────────────────────────────────────────────────
 
-ESPLORA_TESTNET = "https://mempool.space/testnet/api"
+ESPLORA_TESTNET = "https://mempool.space/testnet4/api"
 
 def get_utxos(address: str) -> list:
     """
@@ -662,7 +688,7 @@ def demo():
         result = broadcast_tx(tx_hex)
         if result:
             print(f"  Başarılı! Txid: {result}")
-            print(f"  Explorer: https://mempool.space/testnet/tx/{result}")
+            print(f"  Explorer: https://mempool.space/testnet4/tx/{result}")
         else:
             print("  Yayınlama başarısız.")
     else:

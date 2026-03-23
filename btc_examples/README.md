@@ -25,7 +25,7 @@ btc_examples/
    - [Transaction Yapısı](#51-transaction-yapısı)
    - [BIP-341 Sighash Algoritması](#52-bip-341-sighash-algoritması)
    - [API Referansı](#53-api-referansı)
-   - [Testnet Kullanım Kılavuzu](#54-testnet-kullanım-kılavuzu)
+   - [Testnet4 Kullanım Kılavuzu](#54-testnet4-kullanım-kılavuzu)
 6. [Güvenlik Uyarıları](#6-güvenlik-uyarıları)
 7. [Mimari Kararlar ve Sınırlılıklar](#7-mimari-kararlar-ve-sınırlılıklar)
 8. [Hata Ayıklama](#8-hata-ayıklama)
@@ -79,8 +79,16 @@ MuSig2 + Taproot (key-path):
 - Python 3.8+
 - Standart kütüphane dışında **sıfır zorunlu bağımlılık**
   (`hashlib`, `secrets`, `struct`, `json`, `urllib` yeterli)
+- Web arayüzü için: `fastapi`, `uvicorn`
 
-### Sanal Ortam Oluşturma
+### Adım 1 — Repoyu Klonla
+
+```bash
+git clone https://github.com/alptekinkekilli/bitcoin-taproot-toolkit.git
+cd bitcoin-taproot-toolkit
+```
+
+### Adım 2 — Sanal Ortam Oluştur ve Aktive Et
 
 ```bash
 # Ortamı oluştur
@@ -91,22 +99,49 @@ source ~/taproot/bin/activate
 
 # Aktive et (Windows PowerShell)
 ~/taproot/Scripts/Activate.ps1
-
-# İsteğe bağlı: yüksek seviyeli wrapper kütüphaneler
-pip install bitcoin-utils bip_utils coincurve
 ```
 
-### Dosyaları Çalıştır
+### Adım 3 — Web Arayüzü Bağımlılıklarını Yükle
 
 ```bash
-cd ~/taproot/btc_examples
+pip install fastapi uvicorn
+```
 
-# MuSig2 demo
+### Adım 4 — Backend'i Başlat
+
+```bash
+# Linux / macOS
+bash start.sh testnet 8000
+
+# ya da doğrudan:
+cd backend
+export USE_CORE_RPC=false
+export BITCOIN_NETWORK=testnet4
+uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Ardından tarayıcında aç: **http://localhost:8000**
+
+### Adım 5 — Komut Satırı Demoları (Opsiyonel)
+
+```bash
+cd btc_examples
+
+# MuSig2 n-of-n multisig demo
 python musig2.py
 
-# Taproot transaction demo (testnet — internet gerektirir)
+# Taproot ham transaction demo (testnet4 — internet bağlantısı gerekir)
 python raw_tx.py
 ```
+
+### Ağ: Bitcoin Testnet4
+
+Bu toolkit **Bitcoin Testnet4** üzerinde çalışır. Testnet4, Testnet3'ün
+yerini alan modern test ağıdır (2024). Adresler `tb1p...` (P2TR) veya
+`tb1q...` (P2WPKH) formatındadır.
+
+> **Not:** Mainnet (`bc1p...`) kullanımı gerçek BTC gerektirir.
+> Testnet coinlerin maddi değeri yoktur — yalnızca test amaçlıdır.
 
 ---
 
@@ -125,8 +160,8 @@ python raw_tx.py
 │                  ANAHTAR AGREGASYONU (KeyAgg)               │
 │                                                             │
 │  L  = H("KeyAgg list", sort([pk1, pk2, ...]))               │
-│  a_i = H("KeyAgg coefficient", L ‖ pk_i) mod N             │
-│  Q  = Σ  a_i · P_i          (agrege açık anahtar)          │
+│  a_i = H("KeyAgg coefficient", L ‖ pk_i) mod N              │
+│  Q  = Σ  a_i · P_i          (agrege açık anahtar)           │
 └──────────────────────┬──────────────────────────────────────┘
                        │ Q (herkese duyur)
                        ▼
@@ -135,17 +170,17 @@ python raw_tx.py
 │                                                             │
 │  Her katılımcı bağımsız olarak:                             │
 │    rand  = random_bytes(32)                                 │
-│    k1    = H("MuSig/nonce", rand ‖ sk ‖ pk ‖ msg ‖ 0x00)  │
-│    k2    = H("MuSig/nonce", rand ‖ sk ‖ pk ‖ msg ‖ 0x01)  │
-│    R1,R2 = k1·G, k2·G     (paylaş, gizli k'ları sakla)     │
+│    k1    = H("MuSig/nonce", rand ‖ sk ‖ pk ‖ msg ‖ 0x00)    │
+│    k2    = H("MuSig/nonce", rand ‖ sk ‖ pk ‖ msg ‖ 0x01)    │
+│    R1,R2 = k1·G, k2·G     (paylaş, gizli k'ları sakla)      │
 └──────────────────────┬──────────────────────────────────────┘
                        │ (R1_i, R2_i) paylaş
                        ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                   NONCE AGREGASYONU                         │
 │                                                             │
-│  R1 = Σ R1_i ,  R2 = Σ R2_i                                │
-│  b  = H("MuSig/noncecoef", R1 ‖ R2 ‖ Q ‖ msg)             │
+│  R1 = Σ R1_i ,  R2 = Σ R2_i                                 │
+│  b  = H("MuSig/noncecoef", R1 ‖ R2 ‖ Q ‖ msg)               │
 │  R  = R1 + b·R2                (nihai nonce noktası)        │
 └──────────────────────┬──────────────────────────────────────┘
                        │
@@ -153,17 +188,17 @@ python raw_tx.py
 ┌─────────────────────────────────────────────────────────────┐
 │                   İMZA TURU (Round 2)                       │
 │                                                             │
-│  e   = H("BIP0340/challenge", R.x ‖ Q.x ‖ msg)            │
-│  s_i = k1 + b·k2 + e·a_i·d_i  (mod N)                     │
-│        (d_i: işaret düzeltilmiş özel anahtar)              │
+│  e   = H("BIP0340/challenge", R.x ‖ Q.x ‖ msg)              │
+│  s_i = k1 + b·k2 + e·a_i·d_i  (mod N)                       │
+│        (d_i: işaret düzeltilmiş özel anahtar)               │
 └──────────────────────┬──────────────────────────────────────┘
                        │ s_i paylaş
                        ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                   İMZA BİRLEŞTİRME                         │
+│                   İMZA BİRLEŞTİRME                          │
 │                                                             │
-│  s   = Σ s_i  (mod N)                                      │
-│  sig = R.x ‖ s          (64 bayt BIP-340 Schnorr imzası)   │
+│  s   = Σ s_i  (mod N)                                       │
+│  sig = R.x ‖ s          (64 bayt BIP-340 Schnorr imzası)    │
 │                                                             │
 │  Doğrulama: s·G == R + e·Q    ← herhangi bir düğüm yapabilir│
 └─────────────────────────────────────────────────────────────┘
@@ -473,80 +508,95 @@ Giriş  : inputs    — List[UTXO]
 ```
 Giriş  : tx_hex — hex string olarak ham transaction
 Çıkış  : txid string (başarı) | None (hata)
-Endpoint: https://mempool.space/testnet/api/tx (HTTP POST)
+Endpoint: https://mempool.space/testnet4/api/tx (HTTP POST)
 ```
 
-### 5.4 Testnet Kullanım Kılavuzu
+### 5.4 Testnet4 Kullanım Kılavuzu
 
-#### Adım 1 — Yeni Anahtar Oluştur
+> Bu toolkit **Bitcoin Testnet4** ağını kullanır.
+> Explorer: https://mempool.space/testnet4
 
-```python
-# raw_tx.py içinde sk satırını değiştir:
-import secrets
+#### Adım 1 — Backend'i Başlat
+
+```bash
+source ~/taproot/bin/activate
+bash start.sh testnet 8000
+# Tarayıcıda aç: http://localhost:8000
+```
+
+#### Adım 2 — Cüzdan Oluştur
+
+Web arayüzünde **Cüzdanlar** sekmesine git → **Yeni Cüzdan** butonuna tıkla.
+Ağ olarak **Testnet4** seç. Oluşturulan `tb1p...` adresini kopyala.
+
+Veya Python ile:
+
+```bash
+# P2TR adresi oluştur
+python3 -c "
+import secrets, sys
+sys.path.insert(0, '.')
+from raw_tx import taproot_address
 sk = secrets.token_bytes(32)
-print("SK (yedekle!):", sk.hex())
+xonly, addr = taproot_address(sk, testnet=True)
+print('SK (yedekle!):', sk.hex())
+print('Adres        :', addr)
+"
 ```
+
+#### Adım 3 — Testnet4 tBTC Al (Faucet)
+
+| Faucet | URL | Limit |
+|--------|-----|-------|
+| **coinfaucet.eu** ⭐ | https://coinfaucet.eu/en/btc-testnet4/ | 24 saatte 1 istek |
+| mempool.space | https://mempool.space/testnet4/faucet | — |
 
 ```bash
-python raw_tx.py
-# Çıktıdan adresi kopyala: tb1p...
+# UTXO onayını bekle (1–2 blok ~ 10–20 dakika)
+curl https://mempool.space/testnet4/api/address/tb1p.../utxo
 ```
 
-#### Adım 2 — Testnet Bakiyesi Al
+#### Adım 4 — Transaction Gönder (Web Arayüzü)
 
-Aşağıdaki faucet sitelerinden birini kullan:
+1. **Gönder** sekmesine git
+2. Gönderen adresini seç
+3. Alıcı adresini gir (`tb1p...` veya `tb1q...`)
+4. Miktar ve ücret belirle
+5. **TX Oluştur** → **Yayınla**
 
-| Faucet | URL |
-|--------|-----|
-| mempool.space | https://mempool.space/testnet/faucet |
-| coinfaucet.eu | https://coinfaucet.eu/en/btc-testnet |
-| bitcoinfaucet.uo1 | https://bitcoinfaucet.uo1.net |
+Explorer'da takip: `https://mempool.space/testnet4/tx/<txid>`
 
-```bash
-# UTXO onayını bekle (genellikle 1–2 blok ~ 10–20 dakika)
-# Durumu kontrol et:
-curl https://mempool.space/testnet/api/address/tb1p.../utxo
-```
+#### Adım 5 — MuSig2 n-of-n Multisig
 
-#### Adım 3 — Transaction Oluştur ve Yayınla
+Web arayüzünde **MuSig2** sekmesi → **Yeni Oturum**:
+
+1. Katılımcı sayısını gir (N ≥ 2)
+2. Ağı **Testnet4** seç → aggregate `tb1p...` adresi oluşur
+3. Faucet'ten bu adrese tBTC gönder
+4. **Nonce Üret** → **İmzala ve Yayınla**
+
+Veya Python ile:
 
 ```python
-# raw_tx.py — gerçek kullanım için düzenle:
+from musig2 import key_aggregation
+from raw_tx import taproot_sighash, _bech32m_encode, _xonly, G
+import secrets
 
-# Alıcı adresi belirle (başka bir testnet adresi)
-recipient_xonly = bytes.fromhex("aabbcc...")   # 32 bayt
-recipient_spk   = bytes([0x51, 0x20]) + recipient_xonly
+sk_alice = secrets.token_bytes(32)
+sk_bob   = secrets.token_bytes(32)
 
-# Ücret hesaplama (yaklaşık):
-# Taproot key-path tx boyutu ≈ 110-150 vbyte
-# Testnet ücreti genellikle 1-5 sat/vbyte yeterli
-fee_sat = 200  # 200 sat sabit ücret (testnet)
-```
+# Açık anahtarları hesapla
+from raw_tx import _point_mul
+pk_alice = _point_mul(int.from_bytes(sk_alice, 'big'), G)
+pk_bob   = _point_mul(int.from_bytes(sk_bob,   'big'), G)
 
-```bash
-python raw_tx.py
-# Başarılı ise txid ekrana yazdırılır:
-# Explorer: https://mempool.space/testnet/tx/<txid>
-```
-
-#### Adım 4 — MuSig2 ile Taproot Harcama
-
-```python
-# musig2.py'den Q elde et
-from musig2 import key_aggregation, xonly_bytes, ...
-Q, _ = key_aggregation(sorted([pk_alice, pk_bob]))
-
-# raw_tx.py'de taproot adresini Q'dan üret
-q_xonly = xonly_bytes(Q)
-spk = bytes([0x51, 0x20]) + q_xonly
-addr = _bech32m_encode("tb", q_xonly)
-
-# Sighash hesapla → musig2.py ile imzala → yayınla
-sighash = taproot_sighash(inputs, outputs, 0)
-sig = partial_sig_agg([
-    partial_sign(k_alice, sk_alice, a_alice, Q, agg_nonce, sighash),
-    partial_sign(k_bob,   sk_bob,   a_bob,   Q, agg_nonce, sighash),
-], R)
+# Anahtar agregasyonu → tek P2TR adresi
+Q, _ = key_aggregation(sorted([
+    pk_alice.x.to_bytes(32,'big'),
+    pk_bob.x.to_bytes(32,'big'),
+]))
+addr = _bech32m_encode("tb", _xonly(Q))
+print("MuSig2 P2TR adres:", addr)
 ```
 
 ---
@@ -634,7 +684,7 @@ Sebep  : Bozuk veya sıkıştırılmamış public key verisi
 ```
 Sebep  : UTXO value veya scriptpubkey yanlış girilmiş
 Çözüm  : Esplora API'dan tx hex'i alıp UTXO değerlerini doğrula
-         curl https://mempool.space/testnet/api/tx/<txid>
+         curl https://mempool.space/testnet4/api/tx/<txid>
 ```
 
 #### `[HATA] Yayınlama başarısız: non-mandatory-script-verify-flag`

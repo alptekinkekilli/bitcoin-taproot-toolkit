@@ -47,15 +47,36 @@ function showTab(name) {
   if (name === 'receive' || name === 'send') populateWalletSelects();
 }
 
+// ── Log Panel ─────────────────────────────────────────────────────────────────
+
+function uiLog(msg, level = 'INFO') {
+  const el = document.getElementById('logEntries');
+  if (!el) return;
+  const colors = { INFO: '#8b949e', OK: '#3fb950', ERR: '#f85149', WARN: '#d29922' };
+  const time = new Date().toTimeString().slice(0, 8);
+  const line = document.createElement('div');
+  line.innerHTML = `<span style="color:#444">${time}</span> <span style="color:${colors[level] || colors.INFO}">${level}:</span> ${msg}`;
+  el.appendChild(line);
+  el.parentElement.scrollTop = el.parentElement.scrollHeight;
+  console.log(`[${level}] ${msg}`);
+}
+
 // ── API helpers ───────────────────────────────────────────────────────────────
 
 async function api(path, opts = {}) {
+  const method = opts.method || 'GET';
+  uiLog(`${method} ${path}`);
   const res = await fetch(API + path, {
     headers: { 'Content-Type': 'application/json' },
     ...opts,
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+  if (!res.ok) {
+    const msg = data.detail || `HTTP ${res.status}`;
+    uiLog(`${method} ${path} → ${res.status} ${msg}`, 'ERR');
+    throw new Error(msg);
+  }
+  uiLog(`${method} ${path} → ${res.status} OK`, 'OK');
   return data;
 }
 
@@ -158,7 +179,7 @@ async function loadRecentTxs() {
       <td>${tx.status?.block_height ? `#${tx.status.block_height}` : '—'}</td>
       <td>${statusBadge(tx.status?.confirmed)}</td>
       <td>
-        <a class="link mono-sm" href="https://mempool.space/testnet/tx/${tx.txid}" target="_blank">↗</a>
+        <a class="link mono-sm" href="https://mempool.space/testnet4/tx/${tx.txid}" target="_blank">↗</a>
       </td>
     </tr>
   `).join('');
@@ -260,7 +281,7 @@ async function broadcastTx() {
   try {
     const r = await post('/api/tx/broadcast', { tx_hex: txHex });
     resultEl.className = 'broadcast-result success';
-    resultEl.innerHTML = `✓ Yayınlandı!<br>TXID: <a class="link" href="https://mempool.space/testnet/tx/${r.txid}" target="_blank">${r.txid}</a>`;
+    resultEl.innerHTML = `✓ Yayınlandı!<br>TXID: <a class="link" href="https://mempool.space/testnet4/tx/${r.txid}" target="_blank">${r.txid}</a>`;
     toast('Transaction yayınlandı!', 'success');
   } catch (e) {
     resultEl.className = 'broadcast-result error';
@@ -316,7 +337,7 @@ async function loadTxHistory() {
       <td><span class="orange mono-sm">${outSum.toLocaleString()} sat</span></td>
       <td>${statusBadge(tx.status?.confirmed)}</td>
       <td>
-        <a class="link" href="https://mempool.space/testnet/tx/${tx.txid}" target="_blank" title="Explorer'da Aç">↗</a>
+        <a class="link" href="https://mempool.space/testnet4/tx/${tx.txid}" target="_blank" title="Explorer'da Aç">↗</a>
       </td>
     </tr>`;
   }).join('');
@@ -403,7 +424,7 @@ function renderMusig2List() {
             <button class="btn btn-orange" onclick="broadcastMusig2('${s.id}')">⚡ Yayınla</button>
           ` : ''}
           <button class="btn btn-ghost sm" onclick="copyAddr('${s.agg_address}')">⎘ Adres Kopyala</button>
-          <a class="btn btn-ghost sm" href="https://mempool.space/testnet/address/${s.agg_address}" target="_blank">↗ Explorer</a>
+          <a class="btn btn-ghost sm" href="https://mempool.space/testnet4/address/${s.agg_address}" target="_blank">↗ Explorer</a>
         </div>
 
         ${s.state === 'SIGNED' && s.tx_hex ? `
@@ -465,6 +486,11 @@ async function musig2SignAndBroadcast() {
     // Auto broadcast
     await broadcastMusig2(sid, true);
     await loadMusig2();
+
+    // Broadcast başarılı — butonu "Kapat" olarak değiştir
+    const btn = document.getElementById('musig2SignBtn');
+    btn.textContent = 'Kapat';
+    btn.onclick = () => closeModal('musig2SignModal');
   } catch (e) {
     toast(e.message, 'error');
   }
@@ -476,7 +502,7 @@ async function broadcastMusig2(sid, fromModal = false) {
     const resultEl = document.getElementById('musig2BroadcastResult');
     if (fromModal) {
       resultEl.className = 'broadcast-result success';
-      resultEl.innerHTML = `✓ Yayınlandı!<br>TXID: <a class="link" href="https://mempool.space/testnet/tx/${r.txid}" target="_blank">${r.txid}</a>`;
+      resultEl.innerHTML = `✓ Yayınlandı!<br>TXID: <a class="link" href="https://mempool.space/testnet4/tx/${r.txid}" target="_blank">${r.txid}</a>`;
     }
     toast('MuSig2 transaction yayınlandı!', 'success');
     await loadMusig2();
@@ -496,7 +522,7 @@ function renderWalletsTable() {
   tbody.innerHTML = state.wallets.map(w => `
     <tr>
       <td><span class="bold">${w.label}</span></td>
-      <td><span class="badge ${w.network === 'testnet' ? 'badge-yellow' : 'badge-green'}">${w.network}</span></td>
+      <td><span class="badge ${w.network === 'mainnet' ? 'badge-green' : 'badge-yellow'}">${w.network}</span></td>
       <td>
         <span class="mono-sm truncate" style="max-width:260px;display:inline-block">${w.address}</span>
         <button class="btn btn-ghost sm" onclick="copyAddr('${w.address}')" style="margin-left:4px">⎘</button>
@@ -508,6 +534,33 @@ function renderWalletsTable() {
       </td>
     </tr>
   `).join('');
+}
+
+async function exportWallets() {
+  uiLog('Yedek alma başlatıldı');
+  try {
+    const data = await get('/api/wallet/export');
+    if (!data.length) {
+      uiLog('Dışa aktarılacak cüzdan yok', 'WARN');
+      toast('Dışa aktarılacak cüzdan yok', 'error');
+      return;
+    }
+    uiLog(`${data.length} cüzdan yedeğe alınıyor…`);
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href     = url;
+    a.download = `taproot-wallets-backup-${new Date().toISOString().slice(0,10)}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    uiLog(`${data.length} cüzdan yedeği indirildi`, 'OK');
+    toast(`${data.length} cüzdan yedeği indirildi`, 'success');
+  } catch (e) {
+    uiLog(`Yedek alma hatası: ${e.message}`, 'ERR');
+    toast(e.message, 'error');
+  }
 }
 
 async function createWallet() {

@@ -27,6 +27,7 @@ secrets.json
 .env
 .env.mainnet
 private_keys.txt
+backend/data/
 
 # OS
 .DS_Store

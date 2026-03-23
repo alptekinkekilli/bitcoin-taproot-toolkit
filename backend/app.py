@@ -95,10 +95,53 @@ def get_utxo_manager(network: str = "testnet") -> UTXOManager:
     return UTXOManager(network=network, rpc=_core_rpc)
 
 
-# ── In-Memory State ────────────────────────────────────────────────────────────
+# ── Kalıcı State (JSON dosyası) ───────────────────────────────────────────────
+#
+# Cüzdan özel anahtarları yalnızca bellekte değil, disk'e de kaydedilir.
+# Sunucu restart'ta cüzdanlar kaybolmaz.
+#
+# Güvenlik: Bu dosya ASLA git'e commit edilmemeli (.gitignore'a eklendi).
+# Üretim için HSM veya şifreli vault kullanın.
 
-wallets: List[Dict] = []          # {id, label, sk_hex, address, network}
-musig2_sessions: Dict[str, Dict] = {}  # session_id → session state
+_DATA_DIR  = os.path.join(os.path.dirname(__file__), "data")
+_WALLETS_F = os.path.join(_DATA_DIR, "wallets.json")
+
+os.makedirs(_DATA_DIR, exist_ok=True)
+
+def _load_wallets() -> List[Dict]:
+    if os.path.exists(_WALLETS_F):
+        try:
+            with open(_WALLETS_F, "r") as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
+
+def _save_wallets():
+    with open(_WALLETS_F, "w") as f:
+        json.dump(wallets, f, indent=2)
+
+_MUSIG2_F = os.path.join(_DATA_DIR, "musig2_sessions.json")
+
+def _load_musig2() -> Dict[str, Dict]:
+    if os.path.exists(_MUSIG2_F):
+        try:
+            with open(_MUSIG2_F, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def _save_musig2():
+    """MuSig2 oturumlarını diske kaydet. JSON-serializable olmayan TxOutput/_inp hariç tutulur."""
+    serializable = {}
+    for sid, s in musig2_sessions.items():
+        serializable[sid] = {k: v for k, v in s.items() if k not in ("_outputs", "_inp")}
+    with open(_MUSIG2_F, "w") as f:
+        json.dump(serializable, f, indent=2)
+
+wallets: List[Dict] = _load_wallets()
+musig2_sessions: Dict[str, Dict] = _load_musig2()
 
 
 # ── Pydantic Models ───────────────────────────────────────────────────────────
@@ -134,11 +177,138 @@ class MusigPartialSign(BaseModel):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+# Bech32 karakter seti
+_BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+
+def _bech32_decode_words(hrp: str, addr: str):
+    """Bech32/Bech32m adres → (witness_version, witness_program_bytes)."""
+    addr_low = addr.lower()
+    if addr_low[:len(hrp)+1] != hrp + "1":
+        return None, None
+    data_chars = addr_low[len(hrp)+1:]
+    data = []
+    for c in data_chars:
+        d = _BECH32_CHARSET.find(c)
+        if d < 0:
+            return None, None
+        data.append(d)
+    # Son 6 karakter checksum — yoksay
+    if len(data) < 7:
+        return None, None
+    decoded = data[:-6]
+    # 5-bit grubunu 8-bit bayta çevir
+    ver = decoded[0]
+    bits5 = decoded[1:]
+    acc, bits, result = 0, 0, []
+    for val in bits5:
+        acc = ((acc << 5) | val) & 0xFFFF_FFFF
+        bits += 5
+        while bits >= 8:
+            bits -= 8
+            result.append((acc >> bits) & 0xFF)
+    return ver, bytes(result)
+
+def address_to_scriptpubkey(addr: str) -> bytes:
+    """
+    Bech32/Bech32m adresi → scriptPubKey baytları.
+
+    Desteklenen tipler:
+      P2WPKH  : tb1q / bc1q → OP_0 OP_PUSH20 <20B>  (22 bayt)
+      P2TR    : tb1p / bc1p → OP_1 OP_PUSH32 <32B>  (34 bayt)
+      P2WSH   : tb1q / bc1q → OP_0 OP_PUSH32 <32B>  (34 bayt)
+
+    BIP-141: scriptPubKey = OP_n <witness_program>
+      witness version 0 → OP_0 = 0x00
+      witness version 1 → OP_1 = 0x51 (Taproot)
+    """
+    addr_low = addr.lower()
+    for hrp in ("tb", "bc", "bcrt"):
+        if addr_low.startswith(hrp + "1"):
+            ver, prog = _bech32_decode_words(hrp, addr_low)
+            if prog is None:
+                raise ValueError(f"Bech32 decode hatası: {addr}")
+            if ver == 0:
+                op_ver = 0x00                    # OP_0
+            else:
+                op_ver = 0x50 + ver              # OP_1..OP_16
+            return bytes([op_ver, len(prog)]) + prog
+    raise ValueError(f"Desteklenmeyen adres formatı: {addr}")
+
+# ── WIF & Descriptor Yardımcıları ────────────────────────────────────────────
+
+_B58_CHARS = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+def _b58encode(data: bytes) -> str:
+    n = int.from_bytes(data, "big")
+    result = ""
+    while n > 0:
+        n, r = divmod(n, 58)
+        result = _B58_CHARS[r] + result
+    for byte in data:
+        if byte == 0:
+            result = "1" + result
+        else:
+            break
+    return result
+
+def sk_to_wif(sk_bytes: bytes, testnet: bool = False) -> str:
+    """32-bayt özel anahtar → WIF (sıkıştırılmış)."""
+    prefix = b"\xef" if testnet else b"\x80"
+    payload = prefix + sk_bytes + b"\x01"
+    checksum = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
+    return _b58encode(payload + checksum)
+
+# BIP-380 Descriptor Checksum
+_DESC_INPUT = "0123456789()[],'/*abcdefgh@:$%{}IJKLMNOPQRSTUVWXYZ&+-.;<=>?!^_|~ijklmnopqrstuvwxyzABCDEFGH`#\"\\ "
+_DESC_CHECKSUM = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+
+def _descsum_polymod(symbols):
+    GEN = [0xf5dee51989, 0xa9fdca3312, 0x1bab10e32d, 0x3706b1677a, 0x644d626ffd]
+    chk = 1
+    for v in symbols:
+        top = chk >> 35
+        chk = (chk & 0x7ffffffff) << 5 ^ v
+        for i in range(5):
+            chk ^= GEN[i] if ((top >> i) & 1) else 0
+    return chk ^ 1
+
+def _descsum_expand(s: str):
+    groups, symbols = [], []
+    for c in s:
+        if c not in _DESC_INPUT:
+            return None
+        v = _DESC_INPUT.find(c)
+        symbols.append(v & 31)
+        groups.append(v >> 5)
+        if len(groups) == 3:
+            symbols.append(groups[0] * 9 + groups[1] * 3 + groups[2])
+            groups = []
+    if groups:
+        rem = len(groups)
+        symbols.append(
+            (rem == 3) * groups[0] * 9 +
+            (rem >= 2) * groups[rem - 2] * 3 +
+            groups[-1]
+        )
+    return symbols
+
+def descsum_create(s: str) -> str:
+    """Descriptor string'e BIP-380 checksum ekler."""
+    exp = _descsum_expand(s)
+    if exp is None:
+        return s
+    checksum = _descsum_polymod(exp + [0] * 8)
+    return s + "#" + "".join(_DESC_CHECKSUM[(checksum >> (5 * (7 - i))) & 31] for i in range(8))
+
 def find_wallet(address: str) -> Optional[Dict]:
     return next((w for w in wallets if w["address"] == address), None)
 
 def esplora_base(network: str) -> str:
-    return "https://mempool.space/testnet/api" if network == "testnet" else "https://mempool.space/api"
+    return {
+        "testnet":  "https://mempool.space/testnet/api",
+        "testnet4": "https://mempool.space/testnet4/api",
+        "mainnet":  "https://mempool.space/api",
+    }.get(network, "https://mempool.space/testnet4/api")
 
 def wallet_public(w: Dict) -> Dict:
     """Özel anahtar olmadan cüzdan verisi döner."""
@@ -172,6 +342,7 @@ def create_wallet(req: WalletCreate):
         "network": req.network,
     }
     wallets.append(wallet)
+    _save_wallets()
 
     # Bitcoin Core v26+ entegrasyonu: descriptor olarak kaydet
     core_import_result = None
@@ -204,6 +375,33 @@ def list_wallets():
     return [wallet_public(w) for w in wallets]
 
 
+@app.get("/api/wallet/export")
+def export_wallets():
+    """
+    Tüm cüzdanları WIF özel anahtarı ve Bitcoin Core descriptor'ı ile dışa aktarır.
+    Dönen descriptor (tr(WIF)#checksum) Bitcoin Core'a importdescriptors ile yüklenebilir.
+    """
+    result = []
+    for w in wallets:
+        sk = bytes.fromhex(w["sk_hex"])
+        testnet = w["network"] != "mainnet"
+        wif = sk_to_wif(sk, testnet=testnet)
+        desc = descsum_create(f"tr({wif})")
+        result.append({
+            "label":      w["label"],
+            "network":    w["network"],
+            "address":    w["address"],
+            "xonly_pk":   w["xonly_pk"],
+            "wif":        wif,
+            "descriptor": desc,
+            "core_import_cmd": (
+                f"bitcoin-cli importdescriptors "
+                f"'[{{\"desc\":\"{desc}\",\"timestamp\":\"now\",\"label\":\"{w['label']}\"}}]'"
+            ),
+        })
+    return result
+
+
 @app.delete("/api/wallet/{address}")
 def delete_wallet(address: str):
     global wallets
@@ -211,6 +409,7 @@ def delete_wallet(address: str):
     wallets = [w for w in wallets if w["address"] != address]
     if len(wallets) == before:
         raise HTTPException(404, "Cüzdan bulunamadı")
+    _save_wallets()
     return {"ok": True}
 
 
@@ -321,22 +520,15 @@ def build_transaction(req: TxRequest):
             cu.is_p2tr = True
 
     # ── Alıcı scriptPubKey ────────────────────────────────────────────────────
-    if not req.to_address.startswith(("tb1p", "bc1p", "bcrt1p")):
-        raise HTTPException(400, "Geçersiz P2TR adresi (tb1p... / bc1p... olmalı)")
-
-    import urllib.request as ur
-    base = esplora_base(w["network"])
+    # P2TR (tb1p/bc1p), P2WPKH (tb1q/bc1q) dahil tüm segwit tipleri desteklenir.
+    # BIP-341 TapSighash yalnızca INPUT scriptpubkey'lerini kapsar (sha_scriptpubkeys),
+    # çıktı scriptpubkey tipi sighash hesabını etkilemez.
+    # Adres doğrudan bech32/bech32m decode ile scriptpubkey'e çevrilir —
+    # Esplora'ya gerek yok, ağ bağımsız çalışır.
     try:
-        with ur.urlopen(f"{base}/address/{req.to_address}", timeout=8) as r:
-            addr_info = json.loads(r.read())
-        recipient_spk = bytes.fromhex(addr_info["scriptpubkey"])
-    except Exception:
-        raise HTTPException(400, "Alıcı adres scriptPubKey'i alınamadı")
-
-    # P2TR çıktı kontrolü
-    is_p2tr, _ = parse_p2tr_scriptpubkey(recipient_spk.hex())
-    if not is_p2tr:
-        raise HTTPException(400, "Alıcı adresi P2TR (Taproot) değil")
+        recipient_spk = address_to_scriptpubkey(req.to_address)
+    except ValueError as exc:
+        raise HTTPException(400, f"Alıcı adres hatalı: {exc}")
 
     # ── Coin Selection (largest-first) ───────────────────────────────────────
     try:
@@ -378,10 +570,30 @@ def build_transaction(req: TxRequest):
 
 @app.post("/api/tx/broadcast")
 def broadcast(req: BroadcastRequest):
-    result = broadcast_tx(req.tx_hex)
-    if result:
-        return {"txid": result}
-    raise HTTPException(400, "Yayınlama başarısız")
+    """
+    TX'i ağa yayınla. raw_tx.broadcast_tx yerine doğrudan Esplora kullanılır:
+    raw_tx modülü uvicorn tarafından import anında cache'lenir ve ESPLORA_TESTNET
+    sabitini o anki değeriyle kilitler. Ağ değişikliği sonrası reload tutarsızlık
+    yaratır. Burada esplora_base() ile her zaman doğru URL seçilir.
+    """
+    import urllib.request as ur, urllib.error
+
+    # Ağı cüzdanlardan tespit et (yoksa testnet4)
+    networks = list({w["network"] for w in wallets}) if wallets else []
+    network  = networks[0] if len(networks) == 1 else os.environ.get("BITCOIN_NETWORK", "testnet4")
+    url      = esplora_base(network) + "/tx"
+
+    try:
+        req2 = ur.Request(url, data=req.tx_hex.encode(),
+                          headers={"Content-Type": "text/plain"})
+        with ur.urlopen(req2, timeout=15) as r:
+            txid = r.read().decode()
+        return {"txid": txid}
+    except urllib.error.HTTPError as e:
+        err = e.read().decode()
+        raise HTTPException(400, f"Yayınlama başarısız: {err}")
+    except Exception as e:
+        raise HTTPException(500, f"Bağlantı hatası: {e}")
 
 
 @app.get("/api/tx/{txid}")
@@ -526,7 +738,7 @@ def create_musig2_session(req: MusigCreate):
 
     pk_list = sorted([bytes.fromhex(p["pk_hex"]) for p in participants])
     Q, _ = key_aggregation(pk_list)
-    testnet = req.network == "testnet"
+    testnet = req.network in ("testnet", "testnet4")
     agg_address = _bech32m_encode("tb" if testnet else "bc", _xonly(Q))
 
     musig2_sessions[sid] = {
@@ -544,6 +756,7 @@ def create_musig2_session(req: MusigCreate):
         "tx_hex": None,
         "utxos": [],
     }
+    _save_musig2()
     return _session_public(musig2_sessions[sid])
 
 
@@ -583,6 +796,7 @@ def generate_nonces(sid: str):
                   for p in s["participants"]]
     agg_R1, agg_R2 = nonce_agg(pub_nonces)
     s["agg_nonce"] = [_xonly(agg_R1).hex(), _xonly(agg_R2).hex()]
+    _save_musig2()
 
     return _session_public(s)
 
@@ -606,12 +820,8 @@ def musig2_sign(sid: str, req: MusigPartialSign):
     u = confirmed[0]
     inp = UTXO(txid=u["txid"], vout=u["vout"], value_sat=u["value"], scriptpubkey=agg_spk)
 
-    import urllib.request, json
-    base = esplora_base(s["network"])
     try:
-        with urllib.request.urlopen(f"{base}/address/{req.to_address}", timeout=8) as r:
-            addr_info = json.loads(r.read())
-        recipient_spk = bytes.fromhex(addr_info["scriptpubkey"])
+        recipient_spk = address_to_scriptpubkey(req.to_address)
     except Exception:
         raise HTTPException(400, "Alıcı adresi doğrulanamadı")
 
@@ -650,6 +860,7 @@ def musig2_sign(sid: str, req: MusigPartialSign):
     s["state"] = "SIGNED"
     s["_outputs"] = outputs
     s["_inp"] = u
+    _save_musig2()
 
     return {
         **_session_public(s),
@@ -665,11 +876,21 @@ def musig2_broadcast(sid: str):
     s = musig2_sessions.get(sid)
     if not s or not s.get("tx_hex"):
         raise HTTPException(400, "İmzalanmış transaction yok")
-    result = broadcast_tx(s["tx_hex"])
-    if result:
+    import urllib.request as ur, urllib.error
+    url = esplora_base(s.get("network", "testnet4")) + "/tx"
+    try:
+        req2 = ur.Request(url, data=s["tx_hex"].encode(),
+                          headers={"Content-Type": "text/plain"})
+        with ur.urlopen(req2, timeout=15) as r:
+            txid = r.read().decode()
         s["state"] = "BROADCAST"
-        return {"txid": result}
-    raise HTTPException(400, "Yayınlama başarısız")
+        _save_musig2()
+        return {"txid": txid}
+    except urllib.error.HTTPError as e:
+        err = e.read().decode()
+        raise HTTPException(400, f"Yayınlama başarısız: {err}")
+    except Exception as e:
+        raise HTTPException(500, f"Bağlantı hatası: {e}")
 
 
 @app.get("/api/musig2/{sid}/utxos")

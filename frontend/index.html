@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Taproot Wallet</title>
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/style.css?v=20260323">
   <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 </head>
 <body>
@@ -15,7 +15,7 @@
       <div class="sidebar-logo">
         <span class="logo-icon">⚡</span>
         <span class="logo-text">Taproot</span>
-        <span class="network-badge" id="networkBadge">testnet</span>
+        <span class="network-badge" id="networkBadge">testnet4</span>
       </div>
       <ul class="nav-list">
         <li class="nav-item active" data-tab="dashboard">
@@ -202,6 +202,7 @@
       <div class="tab" id="tab-wallets">
         <div class="page-header">
           <h1>Cüzdan Yönetimi</h1>
+          <button class="btn btn-ghost" onclick="exportWallets()" title="WIF + descriptor yedeği indir">⬇ Yedek Al</button>
           <button class="btn btn-primary" onclick="openNewWalletModal()">+ Yeni Cüzdan</button>
         </div>
         <div class="table-wrap">
@@ -217,6 +218,17 @@
     </main>
   </div>
 
+  <!-- ── LOG PANEL ── -->
+  <div id="logPanel" style="
+    position:fixed; bottom:0; left:0; right:0;
+    background:#0d1117; border-top:1px solid #30363d;
+    font-family:monospace; font-size:11px; color:#8b949e;
+    max-height:120px; overflow-y:auto; padding:4px 12px;
+    z-index:999;
+  ">
+    <div id="logEntries"></div>
+  </div>
+
   <!-- ── MODALS ── -->
 
   <!-- New Wallet Modal -->
@@ -225,7 +237,7 @@
       <div class="modal-header"><h3>Yeni Cüzdan Oluştur</h3><button class="modal-close" onclick="closeModal('newWalletModal')">✕</button></div>
       <div class="form-group"><label class="form-label">Etiket</label><input class="form-input" id="newWalletLabel" placeholder="Ana Cüzdan"></div>
       <div class="form-group"><label class="form-label">Ağ</label>
-        <select class="form-select" id="newWalletNetwork"><option value="testnet">Testnet</option><option value="mainnet">Mainnet</option></select>
+        <select class="form-select" id="newWalletNetwork"><option value="testnet4" selected>Testnet4</option><option value="mainnet">Mainnet</option></select>
       </div>
       <div class="modal-footer">
         <button class="btn btn-ghost" onclick="closeModal('newWalletModal')">İptal</button>
@@ -243,7 +255,7 @@
         <input class="form-input" id="musig2N" type="number" value="2" min="2" max="10">
       </div>
       <div class="form-group"><label class="form-label">Ağ</label>
-        <select class="form-select" id="musig2Network"><option value="testnet">Testnet</option><option value="mainnet">Mainnet</option></select>
+        <select class="form-select" id="musig2Network"><option value="testnet4" selected>Testnet4</option><option value="mainnet">Mainnet</option></select>
       </div>
       <div class="modal-footer">
         <button class="btn btn-ghost" onclick="closeModal('newMusig2Modal')">İptal</button>
@@ -278,6 +290,6 @@
 
   <div id="toast" class="toast"></div>
 
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=20260323"></script>
 </body>
 </html>
