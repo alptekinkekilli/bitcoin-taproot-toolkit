@@ -143,6 +143,23 @@ def _save_musig2():
 wallets: List[Dict] = _load_wallets()
 musig2_sessions: Dict[str, Dict] = _load_musig2()
 
+_DMUSIG2_F = os.path.join(_DATA_DIR, "dmusig2_sessions.json")
+
+def _load_dmusig2() -> Dict[str, Dict]:
+    if os.path.exists(_DMUSIG2_F):
+        try:
+            with open(_DMUSIG2_F, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def _save_dmusig2():
+    with open(_DMUSIG2_F, "w") as f:
+        json.dump(dmusig2_sessions, f, indent=2)
+
+dmusig2_sessions: Dict[str, Dict] = _load_dmusig2()
+
 
 # ── Pydantic Models ───────────────────────────────────────────────────────────
 
@@ -173,6 +190,30 @@ class MusigPartialSign(BaseModel):
     to_address: str
     amount_sat: int
     fee_sat: int = 500
+
+# ── Dağıtık MuSig2 Models ─────────────────────────────────────────────────────
+
+class DMusig2Create(BaseModel):
+    label: str
+    n_participants: int
+    network: str = "testnet4"
+
+class DMusig2Register(BaseModel):
+    participant_index: int
+    pubkey_hex: str  # 33 bytes compressed hex
+
+class DMusig2BuildTx(BaseModel):
+    to_address: str
+    amount_sat: int
+    fee_sat: int = 500
+
+class DMusig2SubmitNonce(BaseModel):
+    participant_index: int
+    pubnonces: List[Dict[str, str]]  # [{r1: hex33, r2: hex33}, ...] one per input
+
+class DMusig2SubmitSig(BaseModel):
+    participant_index: int
+    partial_sigs: List[str]  # [hex32_scalar, ...] one per input
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1207,6 +1248,339 @@ def _session_public(s: Dict) -> Dict:
         if k2 not in ("sk_hex", "nonce_secret", "partial_sig")
     } for p in s["participants"]]
     return result
+
+
+# ── Dağıtık MuSig2 Endpoints ──────────────────────────────────────────────────
+#
+# Backend YALNIZCA koordinatördür: pubkey, pubnonce, partial_sig toplar.
+# Özel anahtarlar asla sunucuya gönderilmez — tüm imzalama tarayıcıda yapılır.
+#
+# Durum makinesi:
+#   COLLECTING_PUBKEYS  → tüm pubkey'ler alındığında → READY_FOR_TX
+#   READY_FOR_TX        → tx parametreleri girildiğinde (sighash hesabı) → COLLECTING_NONCES
+#   COLLECTING_NONCES   → tüm nonce'lar alındığında → COLLECTING_SIGS
+#   COLLECTING_SIGS     → tüm partial_sig'ler alındığında → SIGNED
+#   SIGNED              → broadcast edildiğinde → BROADCAST
+
+@app.post("/api/musig2d/new")
+def create_dmusig2_session(req: DMusig2Create):
+    if req.n_participants < 2 or req.n_participants > 10:
+        raise HTTPException(400, "Katılımcı sayısı 2-10 arasında olmalı")
+    sid = str(uuid.uuid4())[:8]
+    participants = [
+        {"index": i, "label": f"Katılımcı {i+1}",
+         "pubkey": None, "pubnonces": [], "partial_sigs": []}
+        for i in range(req.n_participants)
+    ]
+    dmusig2_sessions[sid] = {
+        "id": sid,
+        "label": req.label,
+        "n": req.n_participants,
+        "network": req.network,
+        "state": "COLLECTING_PUBKEYS",
+        "participants": participants,
+        "pk_list_sorted": [],
+        "agg_xonly": None,
+        "agg_address": None,
+        "agg_nonces": [],     # [{r1: hex, r2: hex}, ...] per input
+        "sighashes": [],      # [hex, ...] per input
+        "inputs": [],
+        "to_address": None,
+        "amount_sat": None,
+        "fee_sat": None,
+        "change_sat": 0,
+        "tx_hex": None,
+        "final_sig": None,
+    }
+    _save_dmusig2()
+    return dmusig2_sessions[sid]
+
+
+@app.get("/api/musig2d/list")
+def list_dmusig2():
+    return list(dmusig2_sessions.values())
+
+
+@app.get("/api/musig2d/{sid}")
+def get_dmusig2_session(sid: str):
+    s = dmusig2_sessions.get(sid)
+    if not s:
+        raise HTTPException(404, "Oturum bulunamadı")
+    return s
+
+
+@app.delete("/api/musig2d/{sid}")
+def delete_dmusig2_session(sid: str):
+    if sid not in dmusig2_sessions:
+        raise HTTPException(404, "Oturum bulunamadı")
+    del dmusig2_sessions[sid]
+    _save_dmusig2()
+    return {"ok": True}
+
+
+@app.post("/api/musig2d/{sid}/register")
+def dmusig2_register(sid: str, req: DMusig2Register):
+    """Katılımcı pubkey'ini kaydeder. Tüm pubkey'ler gelince agg_address hesaplanır."""
+    s = dmusig2_sessions.get(sid)
+    if not s:
+        raise HTTPException(404, "Oturum bulunamadı")
+    if s["state"] != "COLLECTING_PUBKEYS":
+        raise HTTPException(400, f"Pubkey kaydı için geçersiz durum: {s['state']}")
+
+    idx = req.participant_index
+    if idx < 0 or idx >= s["n"]:
+        raise HTTPException(400, f"Geçersiz katılımcı indeksi: {idx}")
+
+    try:
+        pk_bytes = bytes.fromhex(req.pubkey_hex)
+        if len(pk_bytes) != 33:
+            raise ValueError("33 byte compressed pubkey gerekli")
+        point_from_bytes(pk_bytes)
+    except Exception as e:
+        raise HTTPException(400, f"Geçersiz pubkey: {e}")
+
+    s["participants"][idx]["pubkey"] = req.pubkey_hex
+
+    if all(p["pubkey"] is not None for p in s["participants"]):
+        pk_list_bytes = sorted([bytes.fromhex(p["pubkey"]) for p in s["participants"]])
+        Q, _ = key_aggregation(pk_list_bytes)
+        testnet = s["network"] in ("testnet", "testnet4")
+        agg_address = _bech32m_encode("tb" if testnet else "bc", _xonly(Q))
+        s["pk_list_sorted"] = [b.hex() for b in pk_list_bytes]
+        s["agg_xonly"] = _xonly(Q).hex()
+        s["agg_address"] = agg_address
+        s["state"] = "READY_FOR_TX"
+
+    _save_dmusig2()
+    return s
+
+
+@app.post("/api/musig2d/{sid}/build-tx")
+def dmusig2_build_tx(sid: str, req: DMusig2BuildTx):
+    """
+    TX parametrelerini alır, UTXO seçer, sighash(ler) hesaplar.
+    Katılımcılar bu sighash üzerinde nonce üretip imzalayacak.
+    """
+    s = dmusig2_sessions.get(sid)
+    if not s:
+        raise HTTPException(404, "Oturum bulunamadı")
+    if s["state"] not in ("READY_FOR_TX", "COLLECTING_NONCES"):
+        raise HTTPException(400, f"TX oluşturma için geçersiz durum: {s['state']}")
+
+    agg_spk = bytes([0x51, 0x20]) + bytes.fromhex(s["agg_xonly"])
+
+    try:
+        utxos_raw = get_utxos(s["agg_address"])
+    except Exception as e:
+        raise HTTPException(502, f"UTXO sorgusu başarısız: {e}")
+
+    confirmed = [u for u in utxos_raw if u.get("status", {}).get("confirmed")]
+    if not confirmed:
+        raise HTTPException(400, "MuSig2 adresinde onaylanmış UTXO yok")
+
+    total_needed = req.amount_sat + req.fee_sat
+    confirmed.sort(key=lambda u: u["value"])
+
+    selected_utxos, total_in = [], 0
+    for u in confirmed:
+        selected_utxos.append(u)
+        total_in += u["value"]
+        if total_in >= total_needed:
+            break
+
+    if total_in < total_needed:
+        avail = sum(u["value"] for u in confirmed)
+        raise HTTPException(400, f"Yetersiz bakiye: {avail} sat, gerekli: {total_needed} sat")
+
+    try:
+        recipient_spk = address_to_scriptpubkey(req.to_address)
+    except Exception as e:
+        raise HTTPException(400, f"Alıcı adres hatası: {e}")
+
+    change_sat = total_in - req.amount_sat - req.fee_sat
+    utxo_objs = [UTXO(txid=u["txid"], vout=u["vout"], value_sat=u["value"], scriptpubkey=agg_spk)
+                 for u in selected_utxos]
+    outputs = [TxOutput(req.amount_sat, recipient_spk)]
+    if change_sat > 546:
+        outputs.append(TxOutput(change_sat, agg_spk))
+
+    sighashes = [taproot_sighash(utxo_objs, outputs, i).hex()
+                 for i in range(len(utxo_objs))]
+
+    s["inputs"] = [{"txid": u["txid"], "vout": u["vout"], "value": u["value"]}
+                   for u in selected_utxos]
+    s["sighashes"] = sighashes
+    s["to_address"] = req.to_address
+    s["amount_sat"] = req.amount_sat
+    s["fee_sat"] = req.fee_sat
+    s["change_sat"] = change_sat if change_sat > 546 else 0
+
+    # Nonce/sig listelerini sıfırla (birden fazla build-tx çağrısına karşı)
+    n_inputs = len(sighashes)
+    for p in s["participants"]:
+        p["pubnonces"] = [None] * n_inputs
+        p["partial_sigs"] = [None] * n_inputs
+    s["agg_nonces"] = [None] * n_inputs
+    s["state"] = "COLLECTING_NONCES"
+
+    _save_dmusig2()
+    return s
+
+
+@app.post("/api/musig2d/{sid}/submit-nonce")
+def dmusig2_submit_nonce(sid: str, req: DMusig2SubmitNonce):
+    """
+    Katılımcı, her input için oluşturduğu pubnonce çiftini gönderir.
+    Tüm katılımcılar gönderince agg_nonce hesaplanır → COLLECTING_SIGS durumuna geçilir.
+    """
+    s = dmusig2_sessions.get(sid)
+    if not s:
+        raise HTTPException(404, "Oturum bulunamadı")
+    if s["state"] != "COLLECTING_NONCES":
+        raise HTTPException(400, f"Nonce gönderimi için geçersiz durum: {s['state']}")
+
+    idx = req.participant_index
+    if idx < 0 or idx >= s["n"]:
+        raise HTTPException(400, f"Geçersiz katılımcı indeksi: {idx}")
+
+    n_inputs = len(s["sighashes"])
+    if len(req.pubnonces) != n_inputs:
+        raise HTTPException(400, f"{n_inputs} input için {n_inputs} nonce gerekli")
+
+    for i, pn in enumerate(req.pubnonces):
+        try:
+            r1 = bytes.fromhex(pn["r1"])
+            r2 = bytes.fromhex(pn["r2"])
+            if len(r1) != 33 or len(r2) != 33:
+                raise ValueError("33-byte compressed point gerekli")
+            point_from_bytes(r1)
+            point_from_bytes(r2)
+        except Exception as e:
+            raise HTTPException(400, f"Input {i} geçersiz nonce: {e}")
+
+    s["participants"][idx]["pubnonces"] = [
+        {"r1": pn["r1"], "r2": pn["r2"]} for pn in req.pubnonces
+    ]
+
+    if all(p["pubnonces"] and all(n is not None for n in p["pubnonces"])
+           for p in s["participants"]):
+        agg_nonces = []
+        for i in range(n_inputs):
+            pub_nonces_i = [
+                (bytes.fromhex(p["pubnonces"][i]["r1"]),
+                 bytes.fromhex(p["pubnonces"][i]["r2"]))
+                for p in s["participants"]
+            ]
+            agg_R1, agg_R2 = nonce_agg(pub_nonces_i)
+            agg_nonces.append({"r1": point_to_bytes(agg_R1).hex(),
+                                "r2": point_to_bytes(agg_R2).hex()})
+        s["agg_nonces"] = agg_nonces
+        s["state"] = "COLLECTING_SIGS"
+
+    _save_dmusig2()
+    return s
+
+
+@app.post("/api/musig2d/{sid}/submit-partial-sig")
+def dmusig2_submit_sig(sid: str, req: DMusig2SubmitSig):
+    """
+    Katılımcı, her input için hesapladığı kısmi imzayı gönderir.
+    Tüm katılımcılar gönderince imzalar birleştirilir ve TX oluşturulur.
+    """
+    s = dmusig2_sessions.get(sid)
+    if not s:
+        raise HTTPException(404, "Oturum bulunamadı")
+    if s["state"] != "COLLECTING_SIGS":
+        raise HTTPException(400, f"İmza gönderimi için geçersiz durum: {s['state']}")
+
+    idx = req.participant_index
+    if idx < 0 or idx >= s["n"]:
+        raise HTTPException(400, f"Geçersiz katılımcı indeksi: {idx}")
+
+    n_inputs = len(s["sighashes"])
+    if len(req.partial_sigs) != n_inputs:
+        raise HTTPException(400, f"{n_inputs} input için {n_inputs} kısmi imza gerekli")
+
+    for i, sig_hex in enumerate(req.partial_sigs):
+        try:
+            sig_bytes = bytes.fromhex(sig_hex)
+            if len(sig_bytes) != 32:
+                raise ValueError("32-byte skaler gerekli")
+        except Exception as e:
+            raise HTTPException(400, f"Input {i} geçersiz kısmi imza: {e}")
+
+    s["participants"][idx]["partial_sigs"] = list(req.partial_sigs)
+
+    if all(p["partial_sigs"] and all(sig is not None for sig in p["partial_sigs"])
+           for p in s["participants"]):
+        # Tüm kısmi imzalar toplandı — aggregate et
+        pk_list_bytes = [bytes.fromhex(pk) for pk in s["pk_list_sorted"]]
+        Q, _ = key_aggregation(pk_list_bytes)
+        agg_spk = bytes([0x51, 0x20]) + bytes.fromhex(s["agg_xonly"])
+
+        utxo_objs = [
+            UTXO(txid=inp["txid"], vout=inp["vout"],
+                 value_sat=inp["value"], scriptpubkey=agg_spk)
+            for inp in s["inputs"]
+        ]
+        try:
+            recipient_spk = address_to_scriptpubkey(s["to_address"])
+        except Exception as e:
+            raise HTTPException(400, f"Alıcı adres hatası: {e}")
+
+        outputs = [TxOutput(s["amount_sat"], recipient_spk)]
+        if s["change_sat"] > 546:
+            outputs.append(TxOutput(s["change_sat"], agg_spk))
+
+        all_final_sigs = []
+        for i in range(n_inputs):
+            sighash = bytes.fromhex(s["sighashes"][i])
+            agg_nonce_i = s["agg_nonces"][i]
+            agg_R1 = point_from_bytes(bytes.fromhex(agg_nonce_i["r1"]))
+            agg_R2 = point_from_bytes(bytes.fromhex(agg_nonce_i["r2"]))
+            agg_nonce_pt = (agg_R1, agg_R2)
+            R, _ = session_ctx(agg_nonce_pt, Q, sighash)
+
+            partial_sigs_i = [
+                int.from_bytes(bytes.fromhex(p["partial_sigs"][i]), "big")
+                for p in s["participants"]
+            ]
+            final_sig = partial_sig_agg(partial_sigs_i, R)
+
+            if not schnorr_verify(sighash, _xonly(Q), final_sig):
+                raise HTTPException(500, f"Input {i} Schnorr doğrulaması başarısız — kısmi imza hatalı")
+
+            all_final_sigs.append(final_sig)
+
+        raw = build_tx(utxo_objs, outputs, all_final_sigs)
+        s["tx_hex"] = raw.hex()
+        s["final_sig"] = all_final_sigs[0].hex()
+        s["state"] = "SIGNED"
+
+    _save_dmusig2()
+    return s
+
+
+@app.post("/api/musig2d/{sid}/broadcast")
+def dmusig2_broadcast(sid: str):
+    s = dmusig2_sessions.get(sid)
+    if not s or not s.get("tx_hex"):
+        raise HTTPException(400, "İmzalanmış transaction yok")
+    import urllib.request as ur, urllib.error
+    url = esplora_base(s.get("network", "testnet4")) + "/tx"
+    try:
+        req2 = ur.Request(url, data=s["tx_hex"].encode(),
+                          headers={"Content-Type": "text/plain"})
+        with ur.urlopen(req2, timeout=15) as r:
+            txid = r.read().decode()
+        s["state"] = "BROADCAST"
+        _save_dmusig2()
+        return {"txid": txid}
+    except ur.error.HTTPError as e:
+        err = e.read().decode()
+        raise HTTPException(400, f"Yayınlama başarısız: {err}")
+    except Exception as e:
+        raise HTTPException(500, f"Bağlantı hatası: {e}")
 
 
 # ── Static Files ──────────────────────────────────────────────────────────────

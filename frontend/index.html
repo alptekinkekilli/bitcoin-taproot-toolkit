@@ -33,6 +33,9 @@
         <li class="nav-item" data-tab="musig2">
           <span class="nav-icon">⊕</span><span>MuSig2</span>
         </li>
+        <li class="nav-item" data-tab="musig2d">
+          <span class="nav-icon">⛓</span><span>Dağıtık MuSig2</span>
+        </li>
         <li class="nav-item" data-tab="wallets">
           <span class="nav-icon">◻</span><span>Cüzdanlar</span>
         </li>
@@ -215,6 +218,123 @@
         </div>
       </div>
 
+      <!-- ── DAĞITIK MUSIG2 ── -->
+      <div class="tab" id="tab-musig2d">
+        <div class="page-header">
+          <h1>Dağıtık MuSig2</h1>
+          <button class="btn btn-ghost" onclick="openModal('dJoinSessionModal')">↗ Oturuma Katıl</button>
+          <button class="btn btn-primary" onclick="dOpenNewSessionModal()">+ Yeni Oturum</button>
+        </div>
+
+        <!-- Açıklama -->
+        <div class="card" style="margin-bottom:16px;background:#0d1117;border-color:#21262d">
+          <p style="margin:0;color:#8b949e;font-size:0.87em;line-height:1.6">
+            <strong style="color:#58a6ff">Dağıtık MuSig2</strong> — her katılımcı kendi özel anahtarını yalnızca kendi tarayıcısında tutar.
+            Sunucu asla özel anahtar görmez; yalnızca <em>pubkey</em>, <em>pubnonce</em> ve <em>partial_sig</em> toplar.
+            2-of-2 veya 3-of-3 Schnorr multisig için uygundur.
+          </p>
+        </div>
+
+        <!-- Oturum Listesi -->
+        <div id="dmusig2SessionList">
+          <div class="empty-state">Henüz dağıtık MuSig2 oturumu yok.<br>Yeni bir oturum oluşturun.</div>
+        </div>
+
+        <!-- Oturum Detay Paneli -->
+        <div id="dmusig2Detail" style="display:none">
+          <div class="section-header">
+            <h2 id="dmusig2DetailLabel">—</h2>
+            <button class="btn btn-ghost sm" onclick="dCloseDetail()">← Listeye Dön</button>
+          </div>
+
+          <!-- Durum Çubuğu -->
+          <div class="card" style="background:#0d1117;padding:12px 16px;margin-bottom:14px">
+            <div style="display:flex;gap:24px;flex-wrap:wrap;font-size:0.88em">
+              <span>Durum: <strong id="dmusig2State" style="color:#f0883e">—</strong></span>
+              <span>Katılımcı: <strong id="dmusig2N">—</strong></span>
+              <span>Ağ: <strong id="dmusig2Network">—</strong></span>
+            </div>
+            <div style="margin-top:8px;font-size:0.82em;color:#8b949e">
+              Oturum ID: <code id="dmusig2Sid" style="color:#58a6ff"></code>
+              <button class="btn btn-ghost sm" style="margin-left:8px" onclick="dCopySid()">⎘</button>
+            </div>
+          </div>
+
+          <!-- Agrege Adres -->
+          <div id="dmusig2AggCard" class="card" style="display:none;margin-bottom:14px">
+            <div class="form-label">MuSig2 Agrege Adresi (P2TR)</div>
+            <div class="address-display" style="margin-top:6px;font-size:0.85em" id="dmusig2AggAddr">—</div>
+            <div class="action-row" style="margin-top:10px">
+              <button class="btn btn-ghost sm" onclick="dCopyAggAddr()">⎘ Kopyala</button>
+              <button class="btn btn-ghost sm" onclick="dRefreshBalance()">↺ Bakiye</button>
+              <span id="dmusig2Balance" style="font-size:0.85em;color:#3fb950;margin-left:12px"></span>
+            </div>
+          </div>
+
+          <!-- Katılımcı Tablosu -->
+          <div class="section-header"><h3>Katılımcılar</h3></div>
+          <div class="table-wrap" style="margin-bottom:16px">
+            <table class="data-table">
+              <thead><tr>
+                <th>#</th><th>Etiket</th><th>Pubkey</th><th>Nonce</th><th>İmza</th>
+              </tr></thead>
+              <tbody id="dmusig2ParticipantTable">
+                <tr><td colspan="5" class="empty">—</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <!-- Katılımcı Aksiyonları (özel anahtar gerektirir) -->
+          <div class="card" id="dmusig2ActionCard">
+            <div class="form-label" style="margin-bottom:10px">Katılımcı Aksiyonu</div>
+            <div class="form-group">
+              <label class="form-label">Katılımcı Numarası</label>
+              <select class="form-select" id="dmusig2MyIndex" style="max-width:160px"></select>
+            </div>
+            <div class="form-group">
+              <label class="form-label">Özel Anahtar (sk hex — yalnızca bu tarayıcıda kalır)</label>
+              <div style="display:flex;gap:8px">
+                <input class="form-input" id="dmusig2MySkInput" placeholder="32-byte hex (64 karakter)" style="font-family:monospace;font-size:0.82em">
+                <button class="btn btn-ghost sm" onclick="dGenerateSk()" title="Yeni anahtar üret">⚙ Üret</button>
+              </div>
+              <div class="form-hint" id="dmusig2MyPkDisplay" style="font-family:monospace;font-size:0.78em;margin-top:4px;word-break:break-all"></div>
+            </div>
+            <div class="action-row" id="dmusig2ActionButtons" style="flex-wrap:wrap;gap:8px"></div>
+          </div>
+
+          <!-- TX Parametreleri (READY_FOR_TX) -->
+          <div class="card" id="dmusig2TxCard" style="display:none">
+            <div class="form-label" style="margin-bottom:10px">Transaction Oluştur</div>
+            <div class="form-group">
+              <label class="form-label">Alıcı Adres</label>
+              <input class="form-input" id="dmusig2TxTo" placeholder="tb1p...">
+            </div>
+            <div class="form-group">
+              <label class="form-label">Miktar (sat)</label>
+              <input class="form-input" id="dmusig2TxAmount" type="number" placeholder="1000" min="546">
+            </div>
+            <div class="form-group">
+              <label class="form-label">Ücret (sat)</label>
+              <input class="form-input" id="dmusig2TxFee" type="number" value="500" min="100">
+            </div>
+            <div class="action-row">
+              <button class="btn btn-primary" onclick="dBuildTx()">Sighash Hesapla</button>
+            </div>
+          </div>
+
+          <!-- İmzalanmış TX -->
+          <div class="card" id="dmusig2SignedCard" style="display:none">
+            <div class="form-label">İmzalanmış Transaction</div>
+            <textarea class="form-textarea mono-sm" id="dmusig2TxHex" readonly rows="3" style="margin-top:8px"></textarea>
+            <div class="action-row" style="margin-top:10px">
+              <button class="btn btn-orange" onclick="dBroadcast()">⚡ Yayınla</button>
+              <button class="btn btn-ghost" onclick="dCopyTxHex()">⎘ Hex Kopyala</button>
+            </div>
+            <div id="dmusig2BroadcastResult" class="broadcast-result"></div>
+          </div>
+        </div>
+      </div>
+
     </main>
   </div>
 
@@ -333,8 +453,62 @@
     </div>
   </div>
 
+  <!-- Yeni Dağıtık MuSig2 Oturumu Modal -->
+  <div class="modal-overlay" id="dNewSessionModal">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>Dağıtık MuSig2 Oturumu Oluştur</h3>
+        <button class="modal-close" onclick="closeModal('dNewSessionModal')">✕</button>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Etiket</label>
+        <input class="form-input" id="dNewLabel" placeholder="2-of-2 Dağıtık Multisig">
+      </div>
+      <div class="form-group">
+        <label class="form-label">Katılımcı Sayısı (N-of-N)</label>
+        <select class="form-select" id="dNewN">
+          <option value="2" selected>2 (2-of-2)</option>
+          <option value="3">3 (3-of-3)</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Ağ</label>
+        <select class="form-select" id="dNewNetwork">
+          <option value="testnet4" selected>Testnet4</option>
+          <option value="mainnet">Mainnet</option>
+        </select>
+      </div>
+      <p style="color:#8b949e;font-size:0.82em;margin:4px 0 0">
+        Oturum oluşturulduktan sonra ID'yi diğer katılımcılarla paylaşın.
+      </p>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" onclick="closeModal('dNewSessionModal')">İptal</button>
+        <button class="btn btn-primary" onclick="dCreateSession()">Oluştur</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Oturuma Katıl Modal -->
+  <div class="modal-overlay" id="dJoinSessionModal">
+    <div class="modal">
+      <div class="modal-header">
+        <h3>Oturuma Katıl</h3>
+        <button class="modal-close" onclick="closeModal('dJoinSessionModal')">✕</button>
+      </div>
+      <div class="form-group">
+        <label class="form-label">Oturum ID</label>
+        <input class="form-input" id="dJoinSidInput" placeholder="abc12345" style="font-family:monospace">
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" onclick="closeModal('dJoinSessionModal')">İptal</button>
+        <button class="btn btn-primary" onclick="dJoinSession()">Katıl</button>
+      </div>
+    </div>
+  </div>
+
   <div id="toast" class="toast"></div>
 
+  <script src="/static/musig2d.js?v=20260330"></script>
   <script src="/static/app.js?v=20260330"></script>
 </body>
 </html>

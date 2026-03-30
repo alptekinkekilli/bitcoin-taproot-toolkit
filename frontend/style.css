@@ -273,6 +273,7 @@ body {
 .badge-yellow { background: var(--yellow-dim); color: var(--yellow); }
 .badge-red    { background: var(--red-dim);    color: var(--red); }
 .badge-blue   { background: #1c3a6b;           color: var(--blue); }
+.badge-orange { background: #3d2000;           color: #f0883e; }
 .badge-gray   { background: var(--bg-4);       color: var(--text-3); }
 
 /* ── Mono text ── */

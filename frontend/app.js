@@ -10,6 +10,7 @@ let state = {
   musig2Sessions: [],
   activeMusig2Session: null,
   autoRefresh: true,
+  dmusig2Session: null,   // aktif dağıtık MuSig2 oturumu
 };
 
 // ── Init ──────────────────────────────────────────────────────────────────────
@@ -44,6 +45,7 @@ function showTab(name) {
   if (name === 'dashboard') refreshDashboard();
   if (name === 'transactions') loadTxHistory();
   if (name === 'musig2') loadMusig2();
+  if (name === 'musig2d') dLoadSessionList();
   if (name === 'receive' || name === 'send') populateWalletSelects();
 }
 
@@ -761,4 +763,441 @@ function toast(msg, type = '') {
   el.textContent = msg;
   el.className = `toast ${type} show`;
   setTimeout(() => el.classList.remove('show'), 3000);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// Dağıtık MuSig2 — Backend: özel anahtar almaz; yalnızca koordinatördür.
+// Tüm secp256k1 + BIP-327 işlemleri musig2d.js (MuSig2D nesnesi) ile yapılır.
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Oturum ID'ye göre tarayıcıda saklanan özel anahtar (secretNonce dahil)
+const D_SK_KEY   = sid => `dmusig2_sk_${sid}`;
+const D_IDX_KEY  = sid => `dmusig2_idx_${sid}`;
+const D_NONCE_KEY = (sid, inp) => `dmusig2_nonce_${sid}_${inp}`;
+
+function dStateBadge(s) {
+  const map = {
+    COLLECTING_PUBKEYS: ['badge-yellow', 'Pubkey Bekleniyor'],
+    READY_FOR_TX:       ['badge-blue',   'TX Hazır'],
+    COLLECTING_NONCES:  ['badge-yellow', 'Nonce Bekleniyor'],
+    COLLECTING_SIGS:    ['badge-orange', 'İmza Bekleniyor'],
+    SIGNED:             ['badge-green',  'İmzalandı'],
+    BROADCAST:          ['badge-green',  '✓ Yayınlandı'],
+  };
+  const [cls, label] = map[s] || ['badge-gray', s];
+  return `<span class="badge ${cls}">${label}</span>`;
+}
+
+// ── Oturum Listesi ─────────────────────────────────────────────────────────
+
+async function dLoadSessionList() {
+  try {
+    const sessions = await get('/api/musig2d/list');
+    const el = document.getElementById('dmusig2SessionList');
+    if (!sessions.length) {
+      el.innerHTML = '<div class="empty-state">Henüz dağıtık MuSig2 oturumu yok.<br>Yeni bir oturum oluşturun.</div>';
+      return;
+    }
+    el.innerHTML = `
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead><tr><th>ID</th><th>Etiket</th><th>N</th><th>Ağ</th><th>Durum</th><th></th></tr></thead>
+          <tbody>
+            ${sessions.map(s => `
+              <tr>
+                <td><code style="font-size:0.82em;color:#58a6ff">${s.id}</code></td>
+                <td>${s.label}</td>
+                <td>${s.n}-of-${s.n}</td>
+                <td>${s.network}</td>
+                <td>${dStateBadge(s.state)}</td>
+                <td>
+                  <button class="btn btn-ghost sm" onclick="dOpenSession('${s.id}')">Aç</button>
+                  <button class="btn btn-ghost sm" onclick="dDeleteSession('${s.id}')" style="color:#f85149">✕</button>
+                </td>
+              </tr>`).join('')}
+          </tbody>
+        </table>
+      </div>`;
+  } catch(e) {
+    uiLog(`Dağıtık MuSig2 listesi yüklenemedi: ${e.message}`, 'ERR');
+  }
+}
+
+// ── Oturum Oluştur ─────────────────────────────────────────────────────────
+
+function dOpenNewSessionModal() { openModal('dNewSessionModal'); }
+
+async function dCreateSession() {
+  const label = document.getElementById('dNewLabel').value.trim() || '2-of-2 Dağıtık';
+  const n     = parseInt(document.getElementById('dNewN').value);
+  const net   = document.getElementById('dNewNetwork').value;
+  try {
+    const s = await post('/api/musig2d/new', {label, n_participants: n, network: net});
+    closeModal('dNewSessionModal');
+    toast('Oturum oluşturuldu', 'success');
+    dOpenSession(s.id);
+  } catch(e) {
+    toast(`Hata: ${e.message}`, 'error');
+  }
+}
+
+// ── Oturuma Katıl ──────────────────────────────────────────────────────────
+
+async function dJoinSession() {
+  const sid = document.getElementById('dJoinSidInput').value.trim();
+  if (!sid) { toast('Oturum ID girin', 'error'); return; }
+  try {
+    await get(`/api/musig2d/${sid}`);
+    closeModal('dJoinSessionModal');
+    dOpenSession(sid);
+  } catch(e) {
+    toast(`Oturum bulunamadı: ${e.message}`, 'error');
+  }
+}
+
+// ── Oturumu Aç / Render ────────────────────────────────────────────────────
+
+async function dOpenSession(sid) {
+  try {
+    const s = await get(`/api/musig2d/${sid}`);
+    state.dmusig2Session = s;
+
+    document.getElementById('dmusig2SessionList').style.display = 'none';
+    document.getElementById('dmusig2Detail').style.display = '';
+
+    dRenderSession(s);
+    document.querySelector('.page-header button[onclick="dOpenNewSessionModal()"]').style.display = 'none';
+    document.querySelector('.page-header button[onclick="openModal(\'dJoinSessionModal\')"]').style.display = 'none';
+  } catch(e) {
+    toast(`Oturum yüklenemedi: ${e.message}`, 'error');
+  }
+}
+
+function dCloseDetail() {
+  document.getElementById('dmusig2Detail').style.display = 'none';
+  document.getElementById('dmusig2SessionList').style.display = '';
+  document.querySelector('.page-header button[onclick="dOpenNewSessionModal()"]').style.display = '';
+  document.querySelector('.page-header button[onclick="openModal(\'dJoinSessionModal\')"]').style.display = '';
+  state.dmusig2Session = null;
+  dLoadSessionList();
+}
+
+function dRenderSession(s) {
+  document.getElementById('dmusig2DetailLabel').textContent = s.label;
+  document.getElementById('dmusig2State').textContent       = s.state;
+  document.getElementById('dmusig2N').textContent           = `${s.n}-of-${s.n}`;
+  document.getElementById('dmusig2Network').textContent     = s.network;
+  document.getElementById('dmusig2Sid').textContent         = s.id;
+
+  // Agrege adres kartı
+  const aggCard = document.getElementById('dmusig2AggCard');
+  if (s.agg_address) {
+    aggCard.style.display = '';
+    document.getElementById('dmusig2AggAddr').textContent = s.agg_address;
+  } else {
+    aggCard.style.display = 'none';
+  }
+
+  // Katılımcı tablosu
+  const tbody = document.getElementById('dmusig2ParticipantTable');
+  tbody.innerHTML = s.participants.map((p, i) => {
+    const pkShort = p.pubkey ? p.pubkey.slice(0,12) + '…' : '—';
+    const nonceOk = p.pubnonces && p.pubnonces.length > 0 && p.pubnonces[0] !== null;
+    const sigOk   = p.partial_sigs && p.partial_sigs.length > 0 && p.partial_sigs[0] !== null;
+    return `<tr>
+      <td>${i+1}</td>
+      <td>${p.label}</td>
+      <td class="mono-sm" style="font-size:0.78em">${pkShort}</td>
+      <td>${nonceOk ? '✓' : '—'}</td>
+      <td>${sigOk ? '✓' : '—'}</td>
+    </tr>`;
+  }).join('');
+
+  // Katılımcı seçici güncelle
+  const idxSel = document.getElementById('dmusig2MyIndex');
+  idxSel.innerHTML = s.participants.map((p, i) =>
+    `<option value="${i}">${p.label}</option>`).join('');
+
+  // Mevcut sk'yı yükle (varsa)
+  const savedSk = localStorage.getItem(D_SK_KEY(s.id));
+  if (savedSk) {
+    document.getElementById('dmusig2MySkInput').value = savedSk;
+    dUpdatePkDisplay();
+  }
+
+  // TX kartı
+  const txCard = document.getElementById('dmusig2TxCard');
+  txCard.style.display = s.state === 'READY_FOR_TX' ? '' : 'none';
+
+  // İmzalanmış TX kartı
+  const signedCard = document.getElementById('dmusig2SignedCard');
+  if (s.state === 'SIGNED' || s.state === 'BROADCAST') {
+    signedCard.style.display = '';
+    document.getElementById('dmusig2TxHex').value = s.tx_hex || '';
+  } else {
+    signedCard.style.display = 'none';
+  }
+
+  // Aksiyon butonları
+  dRenderActionButtons(s);
+}
+
+function dRenderActionButtons(s) {
+  const container = document.getElementById('dmusig2ActionButtons');
+  const btns = [];
+
+  if (s.state === 'COLLECTING_PUBKEYS') {
+    btns.push(`<button class="btn btn-primary" onclick="dRegisterPubkey()">Pubkey Kaydet</button>`);
+  }
+  if (s.state === 'COLLECTING_NONCES') {
+    btns.push(`<button class="btn btn-primary" onclick="dSubmitNonce()">Nonce Üret & Gönder</button>`);
+  }
+  if (s.state === 'COLLECTING_SIGS') {
+    btns.push(`<button class="btn btn-primary" onclick="dSubmitPartialSig()">Kısmi İmza Üret & Gönder</button>`);
+  }
+  if (s.state === 'SIGNED') {
+    btns.push(`<button class="btn btn-orange" onclick="dBroadcast()">⚡ Yayınla</button>`);
+  }
+  btns.push(`<button class="btn btn-ghost sm" onclick="dRefreshSession()">↺ Güncelle</button>`);
+
+  container.innerHTML = btns.join('');
+}
+
+// ── Özel Anahtar Yönetimi ─────────────────────────────────────────────────
+
+function dGenerateSk() {
+  const sk = MuSig2D.generatePrivateKey();
+  document.getElementById('dmusig2MySkInput').value = sk;
+  const sid = state.dmusig2Session?.id;
+  if (sid) localStorage.setItem(D_SK_KEY(sid), sk);
+  dUpdatePkDisplay();
+  toast('Yeni özel anahtar üretildi', 'success');
+}
+
+function dUpdatePkDisplay() {
+  const skHex = document.getElementById('dmusig2MySkInput').value.trim();
+  const hint  = document.getElementById('dmusig2MyPkDisplay');
+  if (!skHex || skHex.length !== 64) { hint.textContent = ''; return; }
+  try {
+    const pkHex = MuSig2D.derivePublicKey(skHex);
+    hint.textContent = `Pubkey: ${pkHex}`;
+    hint.style.color = '#3fb950';
+    // Oturum açıksa sk'yı kaydet
+    const sid = state.dmusig2Session?.id;
+    if (sid) localStorage.setItem(D_SK_KEY(sid), skHex);
+  } catch(e) {
+    hint.textContent = `Hata: ${e.message}`;
+    hint.style.color = '#f85149';
+  }
+}
+
+// sk input değişince pubkey'i güncelle
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('dmusig2MySkInput').addEventListener('input', dUpdatePkDisplay);
+});
+
+// ── Pubkey Kaydet ──────────────────────────────────────────────────────────
+
+async function dRegisterPubkey() {
+  const s     = state.dmusig2Session;
+  const skHex = document.getElementById('dmusig2MySkInput').value.trim();
+  const idx   = parseInt(document.getElementById('dmusig2MyIndex').value);
+  if (!s) { toast('Oturum yüklenmedi', 'error'); return; }
+  if (!skHex || skHex.length !== 64) { toast('Geçerli özel anahtar girin (64 hex)', 'error'); return; }
+
+  try {
+    const pkHex = MuSig2D.derivePublicKey(skHex);
+    const updated = await post(`/api/musig2d/${s.id}/register`,
+      { participant_index: idx, pubkey_hex: pkHex });
+    state.dmusig2Session = updated;
+    dRenderSession(updated);
+    toast(`Katılımcı ${idx+1} pubkey kaydedildi`, 'success');
+  } catch(e) {
+    toast(`Pubkey kaydı başarısız: ${e.message}`, 'error');
+  }
+}
+
+// ── TX Oluştur (koordinatör) ──────────────────────────────────────────────
+
+async function dBuildTx() {
+  const s = state.dmusig2Session;
+  if (!s) return;
+  const to_address = document.getElementById('dmusig2TxTo').value.trim();
+  const amount_sat = parseInt(document.getElementById('dmusig2TxAmount').value);
+  const fee_sat    = parseInt(document.getElementById('dmusig2TxFee').value) || 500;
+  if (!to_address) { toast('Alıcı adres girin', 'error'); return; }
+  if (!amount_sat || amount_sat < 546) { toast('Geçerli miktar girin (min 546 sat)', 'error'); return; }
+
+  try {
+    const updated = await post(`/api/musig2d/${s.id}/build-tx`,
+      { to_address, amount_sat, fee_sat });
+    state.dmusig2Session = updated;
+    dRenderSession(updated);
+    toast(`Sighash hesaplandı — ${updated.sighashes?.length || 0} input`, 'success');
+  } catch(e) {
+    toast(`TX oluşturma başarısız: ${e.message}`, 'error');
+  }
+}
+
+// ── Nonce Üret & Gönder ────────────────────────────────────────────────────
+
+async function dSubmitNonce() {
+  const s     = state.dmusig2Session;
+  const skHex = document.getElementById('dmusig2MySkInput').value.trim();
+  const idx   = parseInt(document.getElementById('dmusig2MyIndex').value);
+  if (!s) { toast('Oturum yüklenmedi', 'error'); return; }
+  if (!skHex || skHex.length !== 64) { toast('Geçerli özel anahtar girin', 'error'); return; }
+  if (!s.sighashes || !s.sighashes.length) { toast('Sighash yok — önce TX oluşturun', 'error'); return; }
+
+  try {
+    const pkHex = MuSig2D.derivePublicKey(skHex);
+    const pubnonces = [];
+
+    for (let i = 0; i < s.sighashes.length; i++) {
+      const result = await MuSig2D.nonceGen(skHex, pkHex, s.sighashes[i]);
+      // Gizli nonce'u tarayıcıda sakla (partial sign için gerekecek)
+      localStorage.setItem(D_NONCE_KEY(s.id, i), JSON.stringify({
+        k1: result.secretNonce.k1.toString(),
+        k2: result.secretNonce.k2.toString(),
+      }));
+      pubnonces.push(result.pubNonce);
+    }
+
+    const updated = await post(`/api/musig2d/${s.id}/submit-nonce`,
+      { participant_index: idx, pubnonces });
+    state.dmusig2Session = updated;
+    dRenderSession(updated);
+    toast('Nonce gönderildi', 'success');
+  } catch(e) {
+    toast(`Nonce gönderimi başarısız: ${e.message}`, 'error');
+  }
+}
+
+// ── Kısmi İmza Üret & Gönder ──────────────────────────────────────────────
+
+async function dSubmitPartialSig() {
+  const s     = state.dmusig2Session;
+  const skHex = document.getElementById('dmusig2MySkInput').value.trim();
+  const idx   = parseInt(document.getElementById('dmusig2MyIndex').value);
+  if (!s) { toast('Oturum yüklenmedi', 'error'); return; }
+  if (!skHex || skHex.length !== 64) { toast('Geçerli özel anahtar girin', 'error'); return; }
+  if (s.state !== 'COLLECTING_SIGS') { toast('Henüz imzalama aşamasında değil', 'error'); return; }
+
+  try {
+    const pkHex = MuSig2D.derivePublicKey(skHex);
+
+    // key_agg_coeff hesapla
+    const coeff = await MuSig2D.keyAggCoeff(s.pk_list_sorted, pkHex);
+
+    const partial_sigs = [];
+
+    for (let i = 0; i < s.sighashes.length; i++) {
+      const nonceRaw = localStorage.getItem(D_NONCE_KEY(s.id, i));
+      if (!nonceRaw) {
+        toast(`Input ${i} için gizli nonce bulunamadı. Önce nonce üretin.`, 'error');
+        return;
+      }
+      const nonceStored = JSON.parse(nonceRaw);
+      const secretNonce = {
+        k1: BigInt(nonceStored.k1),
+        k2: BigInt(nonceStored.k2),
+      };
+
+      const aggNonce = s.agg_nonces[i];   // {r1: hex33, r2: hex33}
+      const sighash  = s.sighashes[i];    // 32-byte hex
+
+      const sigHex = await MuSig2D.partialSign(
+        secretNonce, skHex, coeff, s.agg_xonly, aggNonce, sighash
+      );
+      partial_sigs.push(sigHex);
+    }
+
+    const updated = await post(`/api/musig2d/${s.id}/submit-partial-sig`,
+      { participant_index: idx, partial_sigs });
+    state.dmusig2Session = updated;
+    dRenderSession(updated);
+
+    if (updated.state === 'SIGNED') {
+      toast('Tüm imzalar toplandı — TX hazır!', 'success');
+    } else {
+      toast('Kısmi imza gönderildi', 'success');
+    }
+  } catch(e) {
+    toast(`Kısmi imza başarısız: ${e.message}`, 'error');
+    uiLog(`partial_sig hata: ${e.message}`, 'ERR');
+  }
+}
+
+// ── Yayınla ────────────────────────────────────────────────────────────────
+
+async function dBroadcast() {
+  const s = state.dmusig2Session;
+  if (!s) return;
+  const result = document.getElementById('dmusig2BroadcastResult');
+  result.textContent = 'Yayınlanıyor...';
+  result.className = 'broadcast-result';
+  try {
+    const res = await post(`/api/musig2d/${s.id}/broadcast`, {});
+    result.textContent = `✓ TXID: ${res.txid}`;
+    result.className = 'broadcast-result success';
+    toast('Transaction yayınlandı!', 'success');
+    const updated = await get(`/api/musig2d/${s.id}`);
+    state.dmusig2Session = updated;
+    dRenderSession(updated);
+  } catch(e) {
+    result.textContent = `Hata: ${e.message}`;
+    result.className = 'broadcast-result error';
+  }
+}
+
+// ── Yardımcılar ────────────────────────────────────────────────────────────
+
+async function dRefreshSession() {
+  const s = state.dmusig2Session;
+  if (!s) return;
+  try {
+    const updated = await get(`/api/musig2d/${s.id}`);
+    state.dmusig2Session = updated;
+    dRenderSession(updated);
+  } catch(e) {
+    toast(`Güncelleme başarısız: ${e.message}`, 'error');
+  }
+}
+
+async function dRefreshBalance() {
+  const s = state.dmusig2Session;
+  if (!s?.agg_address) return;
+  try {
+    const b = await get(`/api/wallet/${s.agg_address}/balance`);
+    document.getElementById('dmusig2Balance').textContent =
+      `${b.confirmed_sat.toLocaleString()} sat onaylı`;
+  } catch(e) {
+    document.getElementById('dmusig2Balance').textContent = 'Bakiye alınamadı';
+  }
+}
+
+async function dDeleteSession(sid) {
+  if (!confirm('Bu oturumu silmek istediğinize emin misiniz?')) return;
+  try {
+    await del(`/api/musig2d/${sid}`);
+    toast('Oturum silindi', 'success');
+    dLoadSessionList();
+  } catch(e) {
+    toast(`Silme başarısız: ${e.message}`, 'error');
+  }
+}
+
+function dCopySid() {
+  const sid = state.dmusig2Session?.id;
+  if (sid) { copyToClipboard(sid); toast('Oturum ID kopyalandı', 'success'); }
+}
+
+function dCopyAggAddr() {
+  const addr = state.dmusig2Session?.agg_address;
+  if (addr) { copyToClipboard(addr); toast('Adres kopyalandı', 'success'); }
+}
+
+function dCopyTxHex() {
+  const hex = document.getElementById('dmusig2TxHex').value;
+  if (hex) { copyToClipboard(hex); toast('TX hex kopyalandı', 'success'); }
 }
