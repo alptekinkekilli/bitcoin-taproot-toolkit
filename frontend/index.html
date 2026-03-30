@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Taproot Wallet</title>
-  <link rel="stylesheet" href="/static/style.css?v=20260323">
+  <link rel="stylesheet" href="/static/style.css?v=20260323b">
   <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 </head>
 <body>
@@ -268,8 +268,19 @@
   <div class="modal-overlay" id="musig2SignModal">
     <div class="modal modal-lg">
       <div class="modal-header"><h3>MuSig2 İmzala & Yayınla</h3><button class="modal-close" onclick="closeModal('musig2SignModal')">✕</button></div>
+      <div id="musig2BalanceBar" style="background:#161b22;border:1px solid #30363d;border-radius:6px;padding:8px 14px;margin-bottom:14px;font-size:13px;display:flex;gap:20px">
+        <span>Bakiye: <strong id="musig2BalConfirmed">—</strong></span>
+        <span style="color:#8b949e">Onaysız: <span id="musig2BalUnconfirmed">—</span></span>
+        <span style="color:#8b949e">UTXO: <span id="musig2BalUtxo">—</span></span>
+      </div>
       <div class="form-group"><label class="form-label">Alıcı Adres</label><input class="form-input" id="musig2ToAddr" placeholder="tb1p..."></div>
-      <div class="form-group"><label class="form-label">Miktar (sat)</label><input class="form-input" id="musig2Amount" type="number" placeholder="1000"></div>
+      <div class="form-group">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+          <label class="form-label" style="margin:0">Miktar (sat)</label>
+          <button class="btn btn-ghost sm" onclick="musig2FillMax()" type="button">Tümünü Gönder</button>
+        </div>
+        <input class="form-input" id="musig2Amount" type="number" placeholder="1000">
+      </div>
       <div class="form-group"><label class="form-label">Ücret (sat)</label><input class="form-input" id="musig2Fee" type="number" value="500"></div>
       <div id="musig2SignResult" style="display:none">
         <div class="tx-detail-grid">
@@ -288,8 +299,42 @@
     </div>
   </div>
 
+  <!-- Sparrow Import Guide Modal -->
+  <div class="modal-overlay" id="sparrowGuideModal">
+    <div class="modal" style="max-width:580px">
+      <div class="modal-header">
+        <h3>Sparrow Wallet Import — Taproot Single-Sig</h3>
+        <button class="modal-close" onclick="closeModal('sparrowGuideModal')">✕</button>
+      </div>
+      <div class="modal-body" style="line-height:1.7">
+
+        <p style="color:#8b949e;font-size:0.85em;margin:0 0 10px">
+          <strong>⬇ Sparrow</strong> butonuyla indirilen <code>.descriptor</code> dosyasındaki
+          <code>MASTER_TPRV</code> satırını aşağıdaki adımlarla Sparrow'a yükle.
+        </p>
+        <ol style="margin:4px 0 4px 20px;padding:0">
+          <li>Sparrow → <code>File → New Wallet</code> → cüzdana isim ver</li>
+          <li>Script Type: <strong>Taproot (Single Sig)</strong></li>
+          <li><em>Keystore 1</em> → <strong>Master Private Key (BIP32)</strong>
+            → <strong>Enter Private Key</strong></li>
+          <li><code>MASTER_TPRV:</code> altındaki <code>tprv8ZgxMBi...</code> satırını yapıştır</li>
+          <li>Derivation: <code>m/86'/1'/0'</code> — otomatik gelir, değiştirme</li>
+          <li><strong>Import Keystore</strong> → <strong>Apply</strong></li>
+        </ol>
+        <p style="color:#8b949e;font-size:0.82em;margin:6px 0 0">
+          Sparrow <strong>Receive</strong> sekmesindeki adres = frontend'deki adres.
+          Transaction'lar Bitcoin Core (testnet4) üzerinden otomatik görünür.
+        </p>
+
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-primary" onclick="closeModal('sparrowGuideModal')">Anladım</button>
+      </div>
+    </div>
+  </div>
+
   <div id="toast" class="toast"></div>
 
-  <script src="/static/app.js?v=20260323"></script>
+  <script src="/static/app.js?v=20260330"></script>
 </body>
 </html>

@@ -3,10 +3,11 @@
 # start.sh — Taproot Wallet Backend Başlatıcı
 # =============================================================================
 # Kullanım:
-#   ./start.sh              → testnet (default, Bitcoin Core gerekmez)
-#   ./start.sh testnet      → testnet (Esplora API)
-#   ./start.sh mainnet      → mainnet (Bitcoin Core v26+ zorunlu)
-#   ./start.sh mainnet 9000 → mainnet, port 9000
+#   ./start.sh                → testnet4 (default, Bitcoin Core gerekmez)
+#   ./start.sh testnet4       → testnet4 (Esplora API)
+#   ./start.sh testnet        → testnet4 (testnet alias)
+#   ./start.sh mainnet        → mainnet (Bitcoin Core v26+ zorunlu)
+#   ./start.sh mainnet 9000   → mainnet, port 9000
 #
 # Mainnet Gereksinimleri:
 #   - Bitcoin Core v26+ çalışıyor olmalı (localhost:8332)
@@ -17,7 +18,9 @@
 
 set -e
 
-NETWORK="${1:-testnet}"
+NETWORK="${1:-testnet4}"
+# testnet ve testnet4 aynı config dosyasını kullanır
+[[ "$NETWORK" == "testnet4" ]] && NETWORK="testnet"
 PORT="${2:-8000}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BACKEND_DIR="$SCRIPT_DIR/backend"

@@ -237,42 +237,72 @@ def _bech32m_encode(hrp: str, data: bytes) -> str:
     checksum = [(polymod >> 5 * (5 - i)) & 31 for i in range(6)]
     return hrp + "1" + "".join(CHARSET[d] for d in values + checksum)
 
-def taproot_address(sk: bytes, testnet: bool = True) -> Tuple[bytes, str]:
+def taproot_tweak_key(sk: bytes) -> Tuple[bytes, bytes]:
     """
-    BIP-341 §Script validation — P2TR adresi üretimi (key-path only).
+    BIP-341 key-path tweak uygular (script-path yok, boş merkle root).
 
     Adımlar:
-        d    = int(sk)
-        P    = d·G
-        eğer P.y tek → d = N - d  (BIP-340: çift y normalleştirme)
-        xonly = P.x (32 bayt)
-        scriptPubKey = OP_1 (0x51) ‖ OP_PUSH32 (0x20) ‖ xonly
-        adres = bech32m_encode(hrp, witness_program=xonly)
+        d  = int(sk)
+        P  = d·G  ;  eğer P.y tek → d = N - d  (BIP-340 normalleştirme)
+        t  = H_TapTweak(P.x)   # tagged hash, 32 byte
+        Q  = P + t·G           # output key
+        d' = (d + t) mod N     # tweaked signing key
 
-    Bu implementasyon "tweaksız" key-path kullanır.
-    Gerçek Taproot adreslerinde internal_key bir tweak ile
-    modifiye edilir:
-        Q = P + H("TapTweak", P.x ‖ merkle_root)·G
-    Tweak, key-path ve script-path harcamayı birlikte destekler.
-    Script-path gerekmiyorsa merkle_root boş bırakılabilir.
+    Argümanlar:
+        sk : 32-bayt özel anahtar (raw scalar)
+
+    Döner:
+        (internal_xonly: bytes,   # P.x — BIP-341 internal key
+         tweaked_sk:     bytes)   # d' bytes — imzalama için kullanılır
+    """
+    d = int.from_bytes(sk, "big")
+    P_pt = _point_mul(d, G)
+    if P_pt.y % 2 != 0:       # BIP-340: even-y normalisation
+        d = N - d
+        P_pt = _point_mul(d, G)
+    internal_xonly = _xonly(P_pt)
+    t = int.from_bytes(_tagged_hash("TapTweak", internal_xonly), "big") % N
+    tweaked_d = (d + t) % N
+    return internal_xonly, tweaked_d.to_bytes(32, "big")
+
+
+def taproot_address(sk: bytes, testnet: bool = True, bip341: bool = True) -> Tuple[bytes, str]:
+    """
+    BIP-341 P2TR adresi üretimi (key-path only).
+
+    bip341=True  (varsayılan): standart BIP-341 tweak uygulanır.
+        Q = P + H_TapTweak(P.x)·G  →  adres = bech32m(Q.x)
+        Bitcoin Core tr() descriptor ve Sparrow ile uyumlu.
+
+    bip341=False (legacy): tweak uygulanmaz, P.x doğrudan adres olur.
+        Geriye dönük uyumluluk — mevcut cüzdanlar için.
 
     Argümanlar:
         sk      : 32-bayt özel anahtar
         testnet : True → tb1p... (testnet), False → bc1p... (mainnet)
+        bip341  : True → BIP-341 tweak (önerilen), False → tweaksız (legacy)
 
     Döner:
-        (xonly_pubkey: bytes, address: str)
+        (internal_xonly: bytes, address: str)
+        bip341=True → internal_xonly = P.x (internal key), adres Q.x'den türetilir
+        bip341=False → internal_xonly = P.x = output key (tweak yok)
     """
-    d = int.from_bytes(sk, "big")
-    P_pt = _point_mul(d, G)
-    # y çift değilse işareti düzelt (BIP340)
-    if P_pt.y % 2 != 0:
-        d = N - d
-        P_pt = _point_mul(d, G)
-    xonly = _xonly(P_pt)
     hrp = "tb" if testnet else "bc"
-    addr = _bech32m_encode(hrp, xonly)
-    return xonly, addr
+    if bip341:
+        internal_xonly, tweaked_sk = taproot_tweak_key(sk)
+        tweaked_d = int.from_bytes(tweaked_sk, "big")
+        Q_pt = _point_mul(tweaked_d, G)
+        output_xonly = _xonly(Q_pt)
+        return internal_xonly, _bech32m_encode(hrp, output_xonly)
+    else:
+        # Legacy: tweaksız (mevcut cüzdanlar için geriye dönük uyumluluk)
+        d = int.from_bytes(sk, "big")
+        P_pt = _point_mul(d, G)
+        if P_pt.y % 2 != 0:
+            d = N - d
+            P_pt = _point_mul(d, G)
+        xonly = _xonly(P_pt)
+        return xonly, _bech32m_encode(hrp, xonly)
 
 
 # ── Yardımcı Serileştirme ─────────────────────────────────────────────────────

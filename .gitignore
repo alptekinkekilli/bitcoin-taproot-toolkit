@@ -8,7 +8,7 @@ __pycache__/
 # Sanal ortam (paylaşılmaz)
 bin/
 lib/
-lib64/
+lib64
 include/
 share/
 pyvenv.cfg
@@ -28,6 +28,7 @@ secrets.json
 .env.mainnet
 private_keys.txt
 backend/data/
+*.descriptor
 
 # OS
 .DS_Store

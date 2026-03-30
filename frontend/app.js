@@ -215,7 +215,7 @@ function updateReceive() {
 function copyReceiveAddress() {
   const addr = document.getElementById('receiveAddress').textContent;
   if (addr && addr !== 'Cüzdan seçin') {
-    navigator.clipboard.writeText(addr);
+    copyToClipboard(addr);
     toast('Adres kopyalandı', 'success');
   }
 }
@@ -292,7 +292,7 @@ async function broadcastTx() {
 
 function copyTxHex() {
   const hex = document.getElementById('txHex').value;
-  if (hex) { navigator.clipboard.writeText(hex); toast('Hex kopyalandı', 'success'); }
+  if (hex) { copyToClipboard(hex); toast('Hex kopyalandı', 'success'); }
 }
 
 // ── Transactions ──────────────────────────────────────────────────────────────
@@ -422,6 +422,10 @@ function renderMusig2List() {
           ` : ''}
           ${s.state === 'SIGNED' ? `
             <button class="btn btn-orange" onclick="broadcastMusig2('${s.id}')">⚡ Yayınla</button>
+            <button class="btn btn-ghost sm" onclick="resetMusig2Nonces('${s.id}')" title="Yeniden imzala">↺ Yeniden İmzala</button>
+          ` : ''}
+          ${s.state === 'BROADCAST' ? `
+            <button class="btn btn-primary" onclick="resetMusig2Nonces('${s.id}')" title="Aynı adres, yeni nonce — yeni işlem imzalamak için">↺ Yeni İşlem</button>
           ` : ''}
           <button class="btn btn-ghost sm" onclick="copyAddr('${s.agg_address}')">⎘ Adres Kopyala</button>
           <a class="btn btn-ghost sm" href="https://mempool.space/testnet4/address/${s.agg_address}" target="_blank">↗ Explorer</a>
@@ -436,6 +440,17 @@ function renderMusig2List() {
       </div>
     </div>`;
   }).join('');
+}
+
+async function resetMusig2Nonces(sid) {
+  try {
+    await post(`/api/musig2/${sid}/nonces`, {});
+    uiLog(`MuSig2 ${sid.slice(0,8)}: yeni nonce üretildi, yeni işlem hazır`, 'OK');
+    toast('Yeni nonce\'lar üretildi — işlem imzalamaya hazır', 'success');
+    await loadMusig2();
+  } catch (e) {
+    toast(e.message, 'error');
+  }
 }
 
 async function generateNonces(sid) {
@@ -454,7 +469,37 @@ function openMusig2SignModal(sid) {
   document.getElementById('musig2BroadcastResult').innerHTML = '';
   document.getElementById('musig2SignBtn').textContent = 'İmzala & Yayınla';
   document.getElementById('musig2SignBtn').onclick = () => musig2SignAndBroadcast();
+
+  // Bakiye göster
+  const s = state.musig2Sessions.find(s => s.id === sid);
+  if (s) {
+    document.getElementById('musig2BalConfirmed').textContent = '…';
+    document.getElementById('musig2BalUnconfirmed').textContent = '…';
+    document.getElementById('musig2BalUtxo').textContent = '…';
+    get(`/api/wallet/${s.agg_address}/balance`).then(b => {
+      const el = document.getElementById('musig2BalConfirmed');
+      el.textContent = `${b.confirmed_sat?.toLocaleString() ?? '—'} sat`;
+      el.dataset.sat = b.confirmed_sat ?? 0;
+      document.getElementById('musig2BalUnconfirmed').textContent =
+        `${b.unconfirmed_sat?.toLocaleString() ?? '—'} sat`;
+      document.getElementById('musig2BalUtxo').textContent = b.utxo_count ?? '—';
+    }).catch(() => {
+      document.getElementById('musig2BalConfirmed').textContent = 'hata';
+    });
+  }
+
   openModal('musig2SignModal');
+}
+
+function musig2FillMax() {
+  const confirmed = parseInt(document.getElementById('musig2BalConfirmed').dataset.sat) || 0;
+  const fee = parseInt(document.getElementById('musig2Fee').value) || 500;
+  const max = confirmed - fee;
+  if (max > 546) {
+    document.getElementById('musig2Amount').value = max;
+  } else {
+    toast('Bakiye yetersiz (ücret dahil)', 'error');
+  }
 }
 
 async function musig2SignAndBroadcast() {
@@ -530,6 +575,7 @@ function renderWalletsTable() {
       <td><span class="mono-xs truncate" style="max-width:200px;display:inline-block">${w.xonly_pk}</span></td>
       <td>
         <button class="btn btn-ghost sm" onclick="quickReceive('${w.address}')">Al</button>
+        <button class="btn btn-ghost sm" onclick="downloadBSMS('${w.label}')" title="Sparrow Wallet için Output Descriptor indir">⬇ Sparrow</button>
         <button class="btn btn-danger sm" onclick="removeWallet('${w.address}')">Sil</button>
       </td>
     </tr>
@@ -559,6 +605,34 @@ async function exportWallets() {
     toast(`${data.length} cüzdan yedeği indirildi`, 'success');
   } catch (e) {
     uiLog(`Yedek alma hatası: ${e.message}`, 'ERR');
+    toast(e.message, 'error');
+  }
+}
+
+async function downloadBSMS(label) {
+  uiLog(`BSMS export: ${label}`);
+  try {
+    const encoded = encodeURIComponent(label);
+    const res = await fetch(`${API}/api/wallet/export-bsms/${encoded}`);
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }));
+      throw new Error(err.detail || `HTTP ${res.status}`);
+    }
+    const text = await res.text();
+    const blob = new Blob([text], { type: 'text/plain' });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement('a');
+    a.href     = url;
+    a.download = label.replace(/\s+/g, '_') + '.descriptor';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    uiLog(`Descriptor indirildi: ${label}.descriptor`, 'OK');
+    toast('Descriptor dosyası indirildi', 'success');
+    openModal('sparrowGuideModal');
+  } catch (e) {
+    uiLog(`BSMS export hatası: ${e.message}`, 'ERR');
     toast(e.message, 'error');
   }
 }
@@ -628,8 +702,23 @@ function quickSend(address) {
   updateSendBalance();
 }
 
+function copyToClipboard(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    return navigator.clipboard.writeText(text);
+  }
+  // HTTP (non-localhost) fallback
+  const el = document.createElement('textarea');
+  el.value = text;
+  el.style.cssText = 'position:fixed;top:-9999px;left:-9999px';
+  document.body.appendChild(el);
+  el.select();
+  document.execCommand('copy');
+  document.body.removeChild(el);
+  return Promise.resolve();
+}
+
 function copyAddr(addr) {
-  navigator.clipboard.writeText(addr);
+  copyToClipboard(addr);
   toast('Adres kopyalandı', 'success');
 }
 

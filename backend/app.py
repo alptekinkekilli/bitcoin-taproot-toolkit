@@ -21,11 +21,11 @@ Bitcoin Core v26+ Entegrasyonu:
         importprivkey / importpubkey artık desteklenmez.
 """
 
-import sys, os, uuid, json, secrets as sec_mod, hashlib, struct
+import sys, os, uuid, json, secrets as sec_mod, hashlib, struct, hmac as _hmac_mod
 from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel
 
 # btc_examples modülleri
@@ -38,7 +38,7 @@ from musig2 import (
     tagged_hash, point_from_bytes
 )
 from raw_tx import (
-    taproot_address, schnorr_sign,
+    taproot_address, taproot_tweak_key, schnorr_sign,
     taproot_sighash, build_tx,
     get_utxos, get_tx_hex, broadcast_tx,
     UTXO, TxOutput, _bech32m_encode, _xonly, _point_mul
@@ -258,6 +258,200 @@ def sk_to_wif(sk_bytes: bytes, testnet: bool = False) -> str:
     checksum = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
     return _b58encode(payload + checksum)
 
+# ── BIP-32 HD Key Derivation (Sparrow Descriptor için) ───────────────────────
+
+# Pure-Python RIPEMD-160 (OpenSSL 3.0+ legacy algoritmaları devre dışı bıraktı)
+def _ripemd160(msg: bytes) -> bytes:
+    """BIP-32 fingerprint için minimal saf-Python RIPEMD-160."""
+    # Sabitler
+    KL = [0x00000000,0x5A827999,0x6ED9EBA1,0x8F1BBCDC,0xA953FD4E]
+    KR = [0x50A28BE6,0x5C4DD124,0x6D703EF3,0x7A6D76E9,0x00000000]
+    RL = [
+        0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
+        7,4,13,1,10,6,15,3,12,0,9,5,2,14,11,8,
+        3,10,14,4,9,15,8,1,2,7,0,6,13,11,5,12,
+        1,9,11,10,0,8,12,4,13,3,7,15,14,5,6,2,
+        4,0,5,9,7,12,2,10,14,1,3,8,11,6,15,13,
+    ]
+    RR = [
+        5,14,7,0,9,2,11,4,13,6,15,8,1,10,3,12,
+        6,11,3,7,0,13,5,10,14,15,8,12,4,9,1,2,
+        15,5,1,3,7,14,6,9,11,8,12,2,10,0,4,13,
+        8,6,4,1,3,11,15,0,5,12,2,13,9,7,10,14,
+        12,15,10,4,1,5,8,7,6,2,13,14,0,3,9,11,
+    ]
+    SL = [
+        11,14,15,12,5,8,7,9,11,13,14,15,6,7,9,8,
+        7,6,8,13,11,9,7,15,7,12,15,9,11,7,13,12,
+        11,13,6,7,14,9,13,15,14,8,13,6,5,12,7,5,
+        11,12,14,15,14,15,9,8,9,14,5,6,8,6,5,12,
+        9,15,5,11,6,8,13,12,5,12,13,14,11,8,5,6,
+    ]
+    SR = [
+        8,9,9,11,13,15,15,5,7,7,8,11,14,14,12,6,
+        9,13,15,7,12,8,9,11,7,7,12,7,6,15,13,11,
+        9,7,15,11,8,6,6,14,12,13,5,14,13,13,7,5,
+        15,5,8,11,14,14,6,14,6,9,12,9,12,5,15,8,
+        8,5,12,9,12,5,14,6,8,13,6,5,15,13,11,11,
+    ]
+    def F(j, x, y, z):
+        if   j < 16: return x ^ y ^ z
+        elif j < 32: return (x & y) | (~x & z)
+        elif j < 48: return (x | ~y) ^ z
+        elif j < 64: return (x & z) | (y & ~z)
+        else:        return x ^ (y | ~z)
+    def rol(x, n): return ((x << n) | (x >> (32-n))) & 0xFFFFFFFF
+    # Padding
+    ml = len(msg) * 8
+    msg += b'\x80'
+    msg += b'\x00' * (-(len(msg) + 8) % 64)
+    msg += ml.to_bytes(8, 'little')
+    h = [0x67452301,0xEFCDAB89,0x98BADCFE,0x10325476,0xC3D2E1F0]
+    for i in range(len(msg) // 64):
+        X = [int.from_bytes(msg[i*64+j*4:i*64+j*4+4],'little') for j in range(16)]
+        al,bl,cl,dl,el = h
+        ar,br,cr,dr,er = h
+        for j in range(80):
+            T = rol((al + F(j,bl,cl,dl) + X[RL[j]] + KL[j//16]) & 0xFFFFFFFF, SL[j])
+            T = (T + el) & 0xFFFFFFFF
+            al,bl,cl,dl,el = el,T,bl,rol(cl,10),dl
+            T = rol((ar + F(79-j,br,cr,dr) + X[RR[j]] + KR[j//16]) & 0xFFFFFFFF, SR[j])
+            T = (T + er) & 0xFFFFFFFF
+            ar,br,cr,dr,er = er,T,br,rol(cr,10),dr
+        T = (h[1] + cl + dr) & 0xFFFFFFFF
+        h[1] = (h[2] + dl + er) & 0xFFFFFFFF
+        h[2] = (h[3] + el + ar) & 0xFFFFFFFF
+        h[3] = (h[4] + al + br) & 0xFFFFFFFF
+        h[4] = (h[0] + bl + cr) & 0xFFFFFFFF
+        h[0] = T
+    return b''.join(x.to_bytes(4,'little') for x in h)
+
+def _bip32_hash160(data: bytes) -> bytes:
+    """RIPEMD160(SHA256(data)) — BIP-32 fingerprint için."""
+    return _ripemd160(hashlib.sha256(data).digest())
+
+def _bip32_pub_compressed(sk: bytes) -> bytes:
+    """32-byte private key → 33-byte compressed public key."""
+    P = point_mul(int.from_bytes(sk, 'big'), G)   # musig2: point_mul(k, pt)
+    prefix = b'\x02' if P.y % 2 == 0 else b'\x03'
+    return prefix + P.x.to_bytes(32, 'big')
+
+def _bip32_child(parent_sk: bytes, parent_chain: bytes, index: int):
+    """
+    BIP-32 child private key derivation.
+    index >= 0x80000000 → hardened.
+    Returns (child_sk, child_chain, parent_fingerprint_4bytes).
+    """
+    parent_pub = _bip32_pub_compressed(parent_sk)
+    parent_fp = _bip32_hash160(parent_pub)[:4]
+    if index >= 0x80000000:
+        data = b'\x00' + parent_sk + index.to_bytes(4, 'big')
+    else:
+        data = parent_pub + index.to_bytes(4, 'big')
+    I = _hmac_mod.new(parent_chain, data, hashlib.sha512).digest()
+    IL, IR = I[:32], I[32:]
+    child_int = (int.from_bytes(IL, 'big') + int.from_bytes(parent_sk, 'big')) % N
+    if child_int == 0 or int.from_bytes(IL, 'big') >= N:
+        raise ValueError("Geçersiz child key (olasılık çok düşük)")
+    return child_int.to_bytes(32, 'big'), IR, parent_fp
+
+def _bip32_xpub(pub: bytes, chain: bytes, depth: int,
+                parent_fp: bytes, child_num: int, testnet: bool) -> str:
+    """BIP-32 genişletilmiş public key → Base58Check string (tpub / xpub)."""
+    version = b'\x04\x35\x87\xcf' if testnet else b'\x04\x88\xb2\x1e'
+    payload = (
+        version +
+        bytes([depth]) +
+        parent_fp +
+        child_num.to_bytes(4, 'big') +
+        chain +
+        pub
+    )
+    chk = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
+    return _b58encode(payload + chk)
+
+def _bip32_xprv(sk: bytes, chain: bytes, depth: int,
+                parent_fp: bytes, child_num: int, testnet: bool = False) -> str:
+    """BIP-32 genişletilmiş private key → Base58Check string (xprv/tprv)."""
+    version = b'\x04\x35\x83\x94' if testnet else b'\x04\x88\xad\xe4'  # tprv / xprv
+    payload = (
+        version +
+        bytes([depth]) +
+        parent_fp +
+        child_num.to_bytes(4, 'big') +
+        chain +
+        b'\x00' + sk
+    )
+    chk = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
+    return _b58encode(payload + chk)
+
+def _hd_child_for_address(seed_sk: bytes, testnet: bool):
+    """
+    BIP-86 HD derivation: seed_sk → m/86'/coin_type'/0'/0/0 → BIP-341 P2TR.
+    Sparrow descriptor'ın ilk receive adresiyle (0/0) eşleşir.
+    Returns: (child_sk_bytes, internal_xonly_bytes, p2tr_address_str)
+    """
+    coin_type = 1 if testnet else 0
+    master_I = _hmac_mod.new(b'Bitcoin seed', seed_sk, hashlib.sha512).digest()
+    master_sk, master_chain = master_I[:32], master_I[32:]
+    k1, c1, _ = _bip32_child(master_sk, master_chain, 0x80000000 + 86)
+    k2, c2, _ = _bip32_child(k1, c1, 0x80000000 + coin_type)
+    k3, c3, _ = _bip32_child(k2, c2, 0x80000000)
+    k4, c4, _ = _bip32_child(k3, c3, 0)   # external chain (receive)
+    k5, _c5, _ = _bip32_child(k4, c4, 0)  # first address index
+    internal_xonly, address = taproot_address(k5, testnet=testnet, bip341=True)
+    return k5, internal_xonly, address
+
+
+def make_sparrow_descriptor(sk_hex: str, testnet: bool = True):
+    """
+    Raw private key → Sparrow-uyumlu BIP-32 HD Taproot descriptor + master xprv.
+
+    Ham private key BIP-32 seed olarak kullanılır:
+        master = HMAC-SHA512("Bitcoin seed", sk_bytes)
+
+    Sparrow testnet4 modunda: tpub + 86h/1h/0h  (BIP-86 testnet, coin_type=1)
+    Sparrow mainnet modunda : xpub + 86h/0h/0h  (BIP-86 mainnet, coin_type=0)
+
+    Returns: (descriptor_str, master_xprv_str)
+    """
+    sk = bytes.fromhex(sk_hex)
+    coin_type = 1 if testnet else 0
+
+    # BIP-32 master key: raw sk'yı seed olarak kullan
+    master_I = _hmac_mod.new(b'Bitcoin seed', sk, hashlib.sha512).digest()
+    master_sk, master_chain = master_I[:32], master_I[32:]
+    master_pub = _bip32_pub_compressed(master_sk)
+    master_fp = _bip32_hash160(master_pub)[:4]
+
+    # Master xprv/tprv (depth=0, Sparrow bunu türetme için kullanır)
+    master_xprv = _bip32_xprv(
+        master_sk, master_chain,
+        depth=0,
+        parent_fp=b'\x00\x00\x00\x00',
+        child_num=0,
+        testnet=testnet,
+    )
+
+    # m/86' → m/86'/coin_type' → m/86'/coin_type'/0'  (BIP-86 account)
+    k1, c1, _ = _bip32_child(master_sk, master_chain, 0x80000000 + 86)
+    k2, c2, _ = _bip32_child(k1, c1, 0x80000000 + coin_type)
+    k3, c3, acct_parent_fp = _bip32_child(k2, c2, 0x80000000)
+
+    account_pub = _bip32_pub_compressed(k3)
+    xpub = _bip32_xpub(
+        account_pub, c3,
+        depth=3,
+        parent_fp=acct_parent_fp,
+        child_num=0x80000000,
+        testnet=testnet,   # tpub (testnet) veya xpub (mainnet)
+    )
+
+    fp_hex = master_fp.hex()
+    path = f"86h/{coin_type}h/0h"
+    inner = f"tr([{fp_hex}/{path}]{xpub}/<0;1>/*)"
+    return descsum_create(inner), master_xprv
+
 # BIP-380 Descriptor Checksum
 _DESC_INPUT = "0123456789()[],'/*abcdefgh@:$%{}IJKLMNOPQRSTUVWXYZ&+-.;<=>?!^_|~ijklmnopqrstuvwxyzABCDEFGH`#\"\\ "
 _DESC_CHECKSUM = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
@@ -329,17 +523,21 @@ def create_wallet(req: WalletCreate):
 
     importprivkey kullanılmaz — descriptor wallet zorunlu (v26+ kısıtı).
     """
-    sk = sec_mod.token_bytes(32)
+    seed_sk = sec_mod.token_bytes(32)
     testnet = req.network in ("testnet", "testnet4")
-    xonly_pk, address = taproot_address(sk, testnet=testnet)
+    # BIP-86 HD: m/86'/coin_type'/0'/0/0 → BIP-341 tweak → adres
+    # Sparrow descriptor'ının ilk receive adresiyle eşleşir.
+    _child_sk, xonly_pk, address = _hd_child_for_address(seed_sk, testnet)
 
     wallet = {
         "id": str(uuid.uuid4())[:8],
         "label": req.label,
-        "sk_hex": sk.hex(),
-        "xonly_pk": xonly_pk.hex(),
-        "address": address,
+        "sk_hex": seed_sk.hex(),      # root seed (HD türetme için)
+        "xonly_pk": xonly_pk.hex(),   # m/86'/…/0'/0/0 internal key
+        "address": address,            # HD child BIP-341 adresi
         "network": req.network,
+        "bip341": True,
+        "hd": True,                   # HD-derived: signing'de child türet
     }
     wallets.append(wallet)
     _save_wallets()
@@ -402,6 +600,61 @@ def export_wallets():
     return result
 
 
+@app.get("/api/wallet/export-bsms/{label}")
+def export_wallet_bsms(label: str):
+    """
+    Sparrow Wallet için BIP-32 HD Taproot descriptor üretir.
+
+    Format: tr([fingerprint/86h/coin_typeh/0h]xpub/<0;1>/*)#checksum
+    Ham private key, BIP-32 seed olarak kullanılarak master key türetilir.
+
+    Sparrow import:
+        File → New Wallet → Script Type: Taproot (Single Sig)
+        Keystore 1 → xPub / Watch Only → descriptor'ı yapıştır.
+    """
+    w = next((x for x in wallets if x["label"] == label), None)
+    if not w:
+        raise HTTPException(404, f"Cüzdan bulunamadı: {label}")
+
+    testnet = w["network"] != "mainnet"
+    sk_hex  = w["sk_hex"]
+    address = w["address"]
+    xonly   = w["xonly_pk"]
+
+    desc, master_xprv = make_sparrow_descriptor(sk_hex, testnet=testnet)
+    xprv_label = "MASTER_TPRV" if testnet else "MASTER_XPRV"
+
+    content = (
+        f"DESCRIPTOR:\n"
+        f"{desc}\n"
+        f"\n"
+        f"{xprv_label} (BIP32 imzalama anahtarı):\n"
+        f"{master_xprv}\n"
+        f"\n"
+        f"# ── Sparrow Wallet Import Rehberi (testnet4) ────────────────────\n"
+        f"# 1. Sparrow → File → New Wallet → isim gir\n"
+        f"# 2. Script Type: Taproot (Single Sig)\n"
+        f"# 3. Keystore 1 → Master Private Key (BIP32) → Enter Private Key\n"
+        f"# 4. {xprv_label} satırını yapıştır\n"
+        f"# 5. Derivation: m/86'/1'/0' — otomatik gelir, değiştirme\n"
+        f"# 6. Import Keystore → Apply\n"
+        f"#\n"
+        f"# Sparrow Receive adresi = aşağıdaki P2TR adresiyle aynı olmalı.\n"
+        f"#\n"
+        f"# ── Cüzdan Bilgileri ─────────────────────────────────────────────\n"
+        f"# Label    : {label}\n"
+        f"# Network  : {w['network']}\n"
+        f"# P2TR Addr: {address}\n"
+        f"# xonly_pk : {xonly}\n"
+    )
+
+    filename = label.replace(" ", "_") + ".descriptor"
+    return PlainTextResponse(
+        content=content,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @app.delete("/api/wallet/{address}")
 def delete_wallet(address: str):
     global wallets
@@ -416,11 +669,15 @@ def delete_wallet(address: str):
 @app.get("/api/wallet/{address}/balance")
 def get_balance(address: str):
     w = find_wallet(address)
-    if not w:
-        raise HTTPException(404, "Cüzdan bulunamadı")
+    # Wallet listesinde yoksa ağı adresten tahmin et (MuSig2 agg adresleri için)
+    if w:
+        network = w["network"]
+    elif address.startswith("tb1") or address.startswith("m") or address.startswith("n"):
+        network = "testnet4"
+    else:
+        network = "mainnet"
 
-    # Core aktifse UTXOManager, değilse Esplora
-    mgr = get_utxo_manager(w["network"])
+    mgr = get_utxo_manager(network)
     try:
         core_utxos = mgr.fetch_utxos(address)
         confirmed   = sum(u.value_sat for u in core_utxos if u.confirmations >= 1)
@@ -530,9 +787,9 @@ def build_transaction(req: TxRequest):
     except ValueError as exc:
         raise HTTPException(400, f"Alıcı adres hatalı: {exc}")
 
-    # ── Coin Selection (largest-first) ───────────────────────────────────────
+    # ── Coin Selection (smallest-first) ──────────────────────────────────────
     try:
-        selected, change_sat = CoinSelector.largest_first(
+        selected, change_sat = CoinSelector.smallest_first(
             confirmed_utxos, req.amount_sat, req.fee_sat
         )
     except ValueError as e:
@@ -546,9 +803,20 @@ def build_transaction(req: TxRequest):
         change_sat = 0  # dust: ücrette erit
 
     # ── İmzalama (SIGHASH_DEFAULT = 0x00) ────────────────────────────────────
+    # hd=True  : HD wallet → child m/86'/…/0'/0/0 türet → BIP-341 tweak
+    # bip341   : Eski tek-key wallet → doğrudan tweak
+    # legacy   : Tweaksız (eski wallet'lar)
+    signing_sk = sk
+    if w.get("hd"):
+        testnet_w = w["network"] != "mainnet"
+        child_sk, _, _ = _hd_child_for_address(sk, testnet_w)
+        _, signing_sk = taproot_tweak_key(child_sk)
+    elif w.get("bip341"):
+        _, signing_sk = taproot_tweak_key(sk)
+
     signer = TaprootSigner(sighash_type=SighashType.DEFAULT)
     try:
-        raw, witnesses = signer.sign_transaction(sk, selected, outputs)
+        raw, witnesses = signer.sign_transaction(signing_sk, selected, outputs)
     except ValueError as e:
         raise HTTPException(400, f"İmzalama hatası: {e}")
 
@@ -790,6 +1058,8 @@ def generate_nonces(sid: str):
         p["pub_nonce"] = [pub[0].hex(), pub[1].hex()]
 
     s["state"] = "NONCES_READY"
+    s["tx_hex"] = None
+    s["final_sig"] = None
 
     # Aggregate nonces
     pub_nonces = [(bytes.fromhex(p["pub_nonce"][0]), bytes.fromhex(p["pub_nonce"][1]))
@@ -816,45 +1086,73 @@ def musig2_sign(sid: str, req: MusigPartialSign):
     if not confirmed:
         raise HTTPException(400, "MuSig2 adresinde UTXO yok")
 
-    confirmed.sort(key=lambda u: u["value"], reverse=True)
-    u = confirmed[0]
-    inp = UTXO(txid=u["txid"], vout=u["vout"], value_sat=u["value"], scriptpubkey=agg_spk)
+    # Smallest-first UTXO seçimi — gerektiği kadar UTXO ekle
+    confirmed.sort(key=lambda u: u["value"])
+    selected, total_in = [], 0
+    for u in confirmed:
+        selected.append(u)
+        total_in += u["value"]
+        if total_in >= req.amount_sat + req.fee_sat:
+            break
+
+    if total_in < req.amount_sat + req.fee_sat:
+        raise HTTPException(
+            400,
+            f"Yetersiz bakiye: toplam {sum(u['value'] for u in confirmed)} sat, "
+            f"gerekli {req.amount_sat + req.fee_sat} sat "
+            f"(miktar {req.amount_sat} + ücret {req.fee_sat})"
+        )
+
+    inputs = [UTXO(txid=u["txid"], vout=u["vout"], value_sat=u["value"], scriptpubkey=agg_spk)
+              for u in selected]
 
     try:
         recipient_spk = address_to_scriptpubkey(req.to_address)
     except Exception:
         raise HTTPException(400, "Alıcı adresi doğrulanamadı")
 
-    change_sat = u["value"] - req.amount_sat - req.fee_sat
+    change_sat = total_in - req.amount_sat - req.fee_sat
     outputs = [TxOutput(req.amount_sat, recipient_spk)]
     if change_sat > 546:
         outputs.append(TxOutput(change_sat, agg_spk))
 
-    sighash = taproot_sighash([inp], outputs, 0)
-
-    # Compute partial sigs for all participants
+    # Her girdi için ayrı nonce üret ve imzala (nonce yeniden kullanımı yok)
     pk_list_bytes = sorted([bytes.fromhex(pk) for pk in s["pk_list"]])
     Q, _ = key_aggregation(pk_list_bytes)
-    pub_nonces = [(bytes.fromhex(p["pub_nonce"][0]), bytes.fromhex(p["pub_nonce"][1]))
-                  for p in s["participants"]]
-    agg_R1, agg_R2 = nonce_agg(pub_nonces)
-    agg_nonce_pt = (agg_R1, agg_R2)
-    R, b = session_ctx(agg_nonce_pt, Q, sighash)
 
-    partial_sigs = []
-    for p in s["participants"]:
-        sk = bytes.fromhex(p["sk_hex"])
-        pk = bytes.fromhex(p["pk_hex"])
-        coeff = key_agg_coeff(pk_list_bytes, pk)
-        k_pair = (p["nonce_secret"][0], p["nonce_secret"][1])
-        si = partial_sign(k_pair, sk, coeff, Q, agg_nonce_pt, sighash)
-        p["partial_sig"] = si
-        partial_sigs.append(si)
+    all_sigs = []
+    for idx in range(len(inputs)):
+        sighash = taproot_sighash(inputs, outputs, idx)
 
-    final_sig = partial_sig_agg(partial_sigs, R)
-    valid = schnorr_verify(sighash, _xonly(Q), final_sig)
+        # Sighash'i nonce tohumu olarak kullan — her girdi için benzersiz
+        per_pub_nonces, per_secrets = [], []
+        for p in s["participants"]:
+            sk_b = bytes.fromhex(p["sk_hex"])
+            pk_b = bytes.fromhex(p["pk_hex"])
+            secret, pub = nonce_gen(sk_b, pk_b, sighash)
+            per_pub_nonces.append((pub[0], pub[1]))
+            per_secrets.append((secret[0], secret[1]))
 
-    raw = build_tx([inp], outputs, [final_sig])
+        agg_R1, agg_R2 = nonce_agg(per_pub_nonces)
+        agg_nonce_pt = (agg_R1, agg_R2)
+        R, _ = session_ctx(agg_nonce_pt, Q, sighash)
+
+        partial_sigs = []
+        for j, p in enumerate(s["participants"]):
+            sk_b = bytes.fromhex(p["sk_hex"])
+            pk_b = bytes.fromhex(p["pk_hex"])
+            coeff = key_agg_coeff(pk_list_bytes, pk_b)
+            si = partial_sign(per_secrets[j], sk_b, coeff, Q, agg_nonce_pt, sighash)
+            partial_sigs.append(si)
+
+        final_sig = partial_sig_agg(partial_sigs, R)
+        if not schnorr_verify(sighash, _xonly(Q), final_sig):
+            raise HTTPException(500, f"Girdi {idx} Schnorr doğrulaması başarısız")
+        all_sigs.append(final_sig)
+
+    valid = True
+    final_sig = all_sigs[0]  # raporlama için
+    raw = build_tx(inputs, outputs, all_sigs)
     s["tx_hex"] = raw.hex()
     s["final_sig"] = final_sig.hex()
     s["state"] = "SIGNED"
