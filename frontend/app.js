@@ -2,6 +2,8 @@
    Taproot Wallet — Frontend SPA
    ═══════════════════════════════════════════════ */
 
+const DEBUG = false;
+
 const API = '';
 let state = {
   wallets: [],
@@ -11,6 +13,9 @@ let state = {
   activeMusig2Session: null,
   autoRefresh: true,
   dmusig2Session: null,   // aktif dağıtık MuSig2 oturumu
+  myPubkey: null,         // Phase 1: oturumdaki kendi pubkey'im
+  myIndex:  null,         // Phase 1: oturumdaki katılımcı indexim
+  myRole:   null,         // Phase 1: 'coordinator' | 'participant' | null
 };
 
 // ── Init ──────────────────────────────────────────────────────────────────────
@@ -45,7 +50,14 @@ function showTab(name) {
   if (name === 'dashboard') refreshDashboard();
   if (name === 'transactions') loadTxHistory();
   if (name === 'musig2') loadMusig2();
-  if (name === 'musig2d') dLoadSessionList();
+  if (name === 'musig2d') {
+    dLoadSessionList();
+    // Phase 3: pubkey biliniyorsa polling'i başlat ve hemen bir tick çalıştır
+    if (state.myPubkey) { dStartPolling(); _dPollTick(); }
+  }
+  // Başka sekmeye geçince polling durdurmaya gerek yok —
+  // badge güncellemesi için arka planda devam etmeli.
+  // Yalnızca page hidden / component unmount'ta durdurulur.
   if (name === 'receive' || name === 'send') populateWalletSelects();
 }
 
@@ -60,7 +72,7 @@ function uiLog(msg, level = 'INFO') {
   line.innerHTML = `<span style="color:#444">${time}</span> <span style="color:${colors[level] || colors.INFO}">${level}:</span> ${msg}`;
   el.appendChild(line);
   el.parentElement.scrollTop = el.parentElement.scrollHeight;
-  console.log(`[${level}] ${msg}`);
+  if (DEBUG) console.log(`[${level}] ${msg}`);
 }
 
 // ── API helpers ───────────────────────────────────────────────────────────────
@@ -771,9 +783,272 @@ function toast(msg, type = '') {
 // ══════════════════════════════════════════════════════════════════════════════
 
 // Oturum ID'ye göre tarayıcıda saklanan özel anahtar (secretNonce dahil)
-const D_SK_KEY   = sid => `dmusig2_sk_${sid}`;
-const D_IDX_KEY  = sid => `dmusig2_idx_${sid}`;
-const D_NONCE_KEY = (sid, inp) => `dmusig2_nonce_${sid}_${inp}`;
+const D_SK_KEY     = sid => `dmusig2_sk_${sid}`;
+const D_ENC_SK_KEY = sid => `dmusig2_enc_sk_${sid}`;
+const D_IDX_KEY    = sid => `dmusig2_idx_${sid}`;
+const D_NONCE_KEY  = (sid, inp) => `dmusig2_nonce_${sid}_${inp}`;
+
+// ── Phase 3: Polling state ────────────────────────────────────────────────
+let _dPollTimer = null;   // setInterval handle — cleanup için clearInterval gerekli
+let _dPolling   = false;  // uçuştaki polling isteği varken yeni tick'i atla (race guard)
+
+// ── Phase 1: PIN tabanlı SK şifreleme ─────────────────────────────────────
+
+async function dEncryptSK(skHex, pin) {
+  const enc = new TextEncoder();
+  const fromHex = hex => new Uint8Array(hex.match(/.{2}/g).map(b => parseInt(b, 16)));
+  const km = await crypto.subtle.importKey('raw', enc.encode(pin), 'PBKDF2', false, ['deriveKey']);
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const key  = await crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' },
+    km, { name: 'AES-GCM', length: 256 }, false, ['encrypt']
+  );
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, enc.encode(skHex));
+  const toHex = buf => Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2,'0')).join('');
+  return { iv: toHex(iv), salt: toHex(salt), ct: toHex(ct) };
+}
+
+async function dDecryptSK(encObj, pin) {
+  const enc    = new TextEncoder();
+  const fromHex = hex => new Uint8Array(hex.match(/.{2}/g).map(b => parseInt(b, 16)));
+  const km = await crypto.subtle.importKey('raw', enc.encode(pin), 'PBKDF2', false, ['deriveKey']);
+  const key = await crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt: fromHex(encObj.salt), iterations: 100000, hash: 'SHA-256' },
+    km, { name: 'AES-GCM', length: 256 }, false, ['decrypt']
+  );
+  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: fromHex(encObj.iv) }, key, fromHex(encObj.ct));
+  return new TextDecoder().decode(pt);
+}
+
+// SK'yı PIN varsa şifreli, yoksa düz kaydeder
+async function dSaveSkWithPin(sid, skHex) {
+  const pin = document.getElementById('dmusig2PinInput')?.value || '';
+  const hasWebCrypto = typeof crypto !== 'undefined' && !!crypto.subtle;
+  if (pin && hasWebCrypto) {
+    try {
+      const encObj = await dEncryptSK(skHex, pin);
+      localStorage.setItem(D_ENC_SK_KEY(sid), JSON.stringify(encObj));
+      localStorage.removeItem(D_SK_KEY(sid));  // düz metin kopyasını temizle
+      return;
+    } catch(e) {
+      uiLog(`PIN şifreleme başarısız, düz metin kaydediliyor: ${e.message}`, 'WARN');
+    }
+  }
+  localStorage.setItem(D_SK_KEY(sid), skHex);
+  localStorage.removeItem(D_ENC_SK_KEY(sid));
+}
+
+// PIN ile şifreli SK'yı çöz ve input'a yaz
+async function dUnlockSk() {
+  const s = state.dmusig2Session;
+  if (!s) return;
+  const pin = document.getElementById('dmusig2PinInput')?.value || '';
+  if (!pin) { toast('PIN girin', 'error'); return; }
+  const encRaw = localStorage.getItem(D_ENC_SK_KEY(s.id));
+  if (!encRaw) { toast('Şifreli SK bulunamadı', 'error'); return; }
+  try {
+    const skHex = await dDecryptSK(JSON.parse(encRaw), pin);
+    document.getElementById('dmusig2MySkInput').value = skHex;
+    dUpdatePkDisplay();
+    toast('SK çözüldü', 'success');
+  } catch(_) {
+    toast('PIN hatalı veya veri bozuk', 'error');
+  }
+}
+
+// ── Phase 3: Polling loop ────────────────────────────────────────────────
+
+const D_POLL_INTERVAL = 3000;  // ms
+
+// Aktif aksiyon sayısına göre nav badge + sayfa başlığı + dashboard güncelle
+function _dUpdateNavBadge(actions) {
+  const ACTIVE = new Set(['build_tx','submit_nonce','submit_partial_sig','broadcast']);
+  const count  = actions.filter(a => ACTIVE.has(a.action)).length;
+  const badge  = document.getElementById('dmusig2NavBadge');
+  if (badge) {
+    badge.textContent   = count || '';
+    badge.style.display = count ? '' : 'none';
+  }
+  const base = 'Taproot Wallet';
+  document.title = count ? `(${count}) ${base}` : base;
+  dRenderDashboard(actions);
+}
+
+// ── Phase 4: Aksiyon Kuyruğu Dashboard ────────────────────────────────────
+
+// Phase 5: Kalan süreyi insan okunabilir formata çevirir
+function _dFormatExpiry(expiresAt) {
+  if (!expiresAt) return null;
+  const ms = expiresAt * 1000 - Date.now();
+  if (ms <= 0) return 'Süresi doldu';
+  const h = Math.floor(ms / 3_600_000);
+  const m = Math.floor((ms % 3_600_000) / 60_000);
+  if (h >= 2) return `${h} saat kaldı`;
+  if (h === 1) return `1 saat ${m} dk kaldı`;
+  return `${m} dk kaldı`;
+}
+
+const _D_ACTION_LABELS = {
+  build_tx:           '⚡ TX oluştur',
+  submit_nonce:       '⚡ Nonce gönder',
+  submit_partial_sig: '⚡ Kısmi imza gönder',
+  broadcast:          '⚡ Yayınla',
+  wait_pubkeys:       '⌛ Diğer pubkey\'ler bekleniyor',
+  wait_coordinator:   '⌛ Koordinatör TX hazırlıyor',
+  wait_nonce:         '⌛ Diğer nonce\'lar bekleniyor',
+  wait_sig:           '⌛ Diğer imzalar bekleniyor',
+  done:               '✓ Tamamlandı',
+};
+
+function _dParticipantIcons(participants) {
+  if (!participants || !participants.length) return '';
+  return participants.map(p => {
+    const nonceIcon = p.has_nonce ? '<span style="color:#3fb950">✓</span>' : '<span style="color:#484f58">—</span>';
+    const sigIcon   = p.has_sig   ? '<span style="color:#3fb950">✓</span>' : '<span style="color:#484f58">—</span>';
+    return `<span style="margin-right:10px;font-size:0.82em;white-space:nowrap">${p.label}: ${nonceIcon}nonce ${sigIcon}imza</span>`;
+  }).join('');
+}
+
+function _dDashCard(entry) {
+  const ACTIVE = new Set(['build_tx','submit_nonce','submit_partial_sig','broadcast']);
+  const isActive = ACTIVE.has(entry.action);
+  const actionLabel = _D_ACTION_LABELS[entry.action] || entry.action;
+  const netColor = entry.network === 'mainnet' ? '#f85149' : '#8b949e';
+
+  // Participant satırı — sadece nonce/sig aşamalarında anlamlı
+  const showParticipants = ['submit_nonce','submit_partial_sig','wait_nonce','wait_sig']
+    .includes(entry.action);
+  const participantRow = showParticipants
+    ? `<div style="margin-top:6px;color:#8b949e">${_dParticipantIcons(entry.participants)}</div>`
+    : '';
+
+  // Phase 5: Kalan süre
+  const expiryStr = _dFormatExpiry(entry.expires_at);
+  const isExpiring = entry.expires_at && (entry.expires_at * 1000 - Date.now()) < 3_600_000;
+  const expiryRow = expiryStr
+    ? `<div style="margin-top:4px;font-size:0.78em;color:${isExpiring ? '#f85149' : '#484f58'}">⏱ ${expiryStr}</div>`
+    : '';
+
+  const borderColor = isActive ? '#f0883e' : '#30363d';
+  const bgColor     = isActive ? '#1a1000' : '#0d1117';
+
+  return `
+    <div style="background:${bgColor};border:1px solid ${borderColor};border-radius:8px;padding:12px 14px;margin-bottom:8px;display:flex;align-items:flex-start;gap:12px;flex-wrap:wrap">
+      <div style="flex:1;min-width:0">
+        <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:4px">
+          <span style="font-weight:600;font-size:0.9em">${entry.label}</span>
+          <span style="font-size:0.75em;color:${netColor}">${entry.network}</span>
+          ${dStateBadge(entry.state)}
+        </div>
+        <div style="color:${isActive ? '#f0883e' : '#8b949e'};font-size:0.85em">${actionLabel}</div>
+        ${participantRow}
+        ${expiryRow}
+      </div>
+      <button class="btn btn-ghost sm" onclick="dOpenSession('${entry.session_id}')" style="white-space:nowrap;align-self:center">Aç →</button>
+    </div>`;
+}
+
+function dRenderDashboard(actions) {
+  const dash = document.getElementById('dmusig2Dashboard');
+  if (!dash) return;
+
+  // Dashboard yalnızca pubkey biliniyorsa anlamlı
+  if (!state.myPubkey || !actions || !actions.length) {
+    dash.style.display = 'none';
+    return;
+  }
+  dash.style.display = '';
+
+  const ACTIVE   = new Set(['build_tx','submit_nonce','submit_partial_sig','broadcast']);
+  const WAITING  = new Set(['wait_pubkeys','wait_coordinator','wait_nonce','wait_sig']);
+
+  const pending   = actions.filter(a => ACTIVE.has(a.action));
+  const watching  = actions.filter(a => WAITING.has(a.action));
+  const completed = actions.filter(a => a.action === 'done');
+
+  const pendingEl   = document.getElementById('dmusig2DashPending');
+  const watchingEl  = document.getElementById('dmusig2DashWatching');
+  const completedEl = document.getElementById('dmusig2DashCompleted');
+
+  pendingEl.innerHTML = pending.length
+    ? pending.map(_dDashCard).join('')
+    : '<div class="empty-state" style="padding:10px 16px;font-size:0.85em">Bekleyen aksiyon yok.</div>';
+
+  watchingEl.innerHTML = watching.length
+    ? watching.map(_dDashCard).join('')
+    : '<div class="empty-state" style="padding:10px 16px;font-size:0.85em">İzlenen oturum yok.</div>';
+
+  completedEl.innerHTML = completed.length
+    ? completed.map(_dDashCard).join('')
+    : '<div class="empty-state" style="padding:10px 16px;font-size:0.85em">Tamamlanan oturum yok.</div>';
+}
+
+// Tek polling ticki — _dPolling flag ile race condition engellenir
+async function _dPollTick() {
+  if (_dPolling) return;              // önceki istek henüz bitmedi, atla
+  const pubkey = state.myPubkey;
+  if (!pubkey) return;               // pubkey henüz bilinmiyor
+
+  _dPolling = true;
+  try {
+    const actions = await get(`/api/musig2d/actions?pubkey=${pubkey}`);
+    _dUpdateNavBadge(actions);
+
+    // Aktif oturumun state'i veya katılımcı nonce/sig durumu değiştiyse yenile
+    const s = state.dmusig2Session;
+    if (s) {
+      const entry = actions.find(a => a.session_id === s.id);
+      if (entry) {
+        const stateChanged = entry.state !== s.state;
+
+        // Aynı state içinde nonce/sig gönderildi mi? (participant tablosu diff)
+        const participantChanged = (entry.participants || []).some((ep, i) => {
+          const sp = s.participants?.[i];
+          if (!sp) return true;
+          const nonceChanged = ep.has_nonce !== !!(sp.pubnonces && sp.pubnonces.length > 0 &&
+                                                   sp.pubnonces[0] !== null);
+          const sigChanged   = ep.has_sig   !== !!(sp.partial_sigs && sp.partial_sigs.length > 0 &&
+                                                   sp.partial_sigs[0] !== null);
+          return nonceChanged || sigChanged;
+        });
+
+        if (stateChanged || participantChanged) {
+          const updated = await get(`/api/musig2d/${s.id}`);
+          state.dmusig2Session = updated;
+          dRenderSession(updated);
+          uiLog(`Oturum güncellendi: ${s.state} → ${updated.state}${participantChanged && !stateChanged ? ' (katılımcı değişimi)' : ''}`, 'OK');
+        }
+      }
+    }
+  } catch(_) {
+    // Polling hataları sessizce yutulur — bağlantı kesilince spam yapma
+  } finally {
+    _dPolling = false;
+  }
+}
+
+function dStartPolling() {
+  if (_dPollTimer !== null) return;  // zaten çalışıyor
+  _dPollTimer = setInterval(_dPollTick, D_POLL_INTERVAL);
+}
+
+function dStopPolling() {
+  if (_dPollTimer === null) return;
+  clearInterval(_dPollTimer);
+  _dPollTimer = null;
+}
+
+// visibilitychange: sekme arka plana geçince durdur, öne gelince devam et
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    dStopPolling();
+  } else if (state.myPubkey) {
+    // Sayfa görünür oldu + pubkey biliniyor → polling'i yeniden başlat
+    dStartPolling();
+    _dPollTick();  // hemen bir tick at, interval bekleme
+  }
+});
 
 function dStateBadge(s) {
   const map = {
@@ -791,6 +1066,12 @@ function dStateBadge(s) {
 // ── Oturum Listesi ─────────────────────────────────────────────────────────
 
 async function dLoadSessionList() {
+  // Phase 4: pubkey biliniyorsa dashboard'u hemen güncelle
+  if (state.myPubkey) {
+    get(`/api/musig2d/actions?pubkey=${state.myPubkey}`)
+      .then(_dUpdateNavBadge)
+      .catch(() => {});
+  }
   try {
     const sessions = await get('/api/musig2d/list');
     const el = document.getElementById('dmusig2SessionList');
@@ -889,6 +1170,20 @@ function dRenderSession(s) {
   document.getElementById('dmusig2Network').textContent     = s.network;
   document.getElementById('dmusig2Sid').textContent         = s.id;
 
+  // Phase 5: Kalan süre gösterimi
+  if (s.created_at) {
+    const expiresAt  = s.created_at + (48 * 3600);
+    const expiryStr  = _dFormatExpiry(expiresAt);
+    const isExpiring = (expiresAt * 1000 - Date.now()) < 3_600_000;
+    const expiryEl   = document.getElementById('dmusig2Expiry');
+    const expiryText = document.getElementById('dmusig2ExpiryText');
+    if (expiryEl && expiryText && expiryStr) {
+      expiryText.textContent  = expiryStr;
+      expiryText.style.color  = isExpiring ? '#f85149' : '#8b949e';
+      expiryEl.style.display  = '';
+    }
+  }
+
   // Fix 1: Güvenli bağlam uyarısı
   const cryptoStatus = MuSig2D.secureContextStatus();
   document.getElementById('dmusig2CryptoWarning').style.display =
@@ -934,12 +1229,36 @@ function dRenderSession(s) {
     idxSel.title = '';
   }
 
-  // Mevcut sk'yı yükle (varsa)
-  const savedSk = localStorage.getItem(D_SK_KEY(s.id));
-  if (savedSk) {
-    document.getElementById('dmusig2MySkInput').value = savedSk;
+  // Phase 1: Rol hesapla (kayıtlı index'e göre)
+  if (savedIdx !== null) {
+    state.myIndex  = parseInt(savedIdx);
+    state.myRole   = state.myIndex === 0 ? 'coordinator' : 'participant';
+    state.myPubkey = s.participants[state.myIndex]?.pubkey || null;
+  } else {
+    state.myIndex  = null;
+    state.myRole   = null;
+    state.myPubkey = null;
+  }
+
+  // Phase 3: pubkey belirlendiyse polling'i (yeniden) başlat
+  if (state.myPubkey && !document.hidden) {
+    dStartPolling();
+  }
+
+  // Mevcut sk'yı yükle (şifreli yoksa) — kullanıcı input'a odaklanmışsa yazmayı atla
+  const hasEncSk = !!localStorage.getItem(D_ENC_SK_KEY(s.id));
+  const savedSk  = localStorage.getItem(D_SK_KEY(s.id));
+  const skInputEl = document.getElementById('dmusig2MySkInput');
+  if (savedSk && !hasEncSk && document.activeElement !== skInputEl) {
+    skInputEl.value = savedSk;
     dUpdatePkDisplay();
   }
+
+  // Phase 1: Şifreli SK rozeti & kilit açma butonu
+  const encSkBadge = document.getElementById('dmusig2EncSkBadge');
+  const unlockBtn  = document.getElementById('dmusig2UnlockBtn');
+  if (encSkBadge) encSkBadge.style.display = hasEncSk ? '' : 'none';
+  if (unlockBtn)  unlockBtn.style.display  = (hasEncSk && !savedSk) ? '' : 'none';
 
   // Fix 3: TX detay paneli — build-tx sonrası tüm katılımcılara göster
   const txDetails = document.getElementById('dmusig2TxDetails');
@@ -962,9 +1281,18 @@ function dRenderSession(s) {
     txDetails.style.display = 'none';
   }
 
-  // TX kartı — yalnızca koordinatör aşamasında
+  // TX kartı — yalnızca koordinatör görebilir (Phase 1c)
+  const isReadyForTx = s.state === 'READY_FOR_TX';
+  const isCoordinator = state.myRole === 'coordinator';
   document.getElementById('dmusig2TxCard').style.display =
-    s.state === 'READY_FOR_TX' ? '' : 'none';
+    (isReadyForTx && isCoordinator) ? '' : 'none';
+
+  // Phase 1c: Koordinatör bekleyici mesajı (participant için)
+  const coordWaiting = document.getElementById('dmusig2CoordWaiting');
+  if (coordWaiting) {
+    coordWaiting.style.display =
+      (isReadyForTx && state.myRole === 'participant') ? '' : 'none';
+  }
 
   // İmzalanmış TX kartı
   const signedCard = document.getElementById('dmusig2SignedCard');
@@ -983,16 +1311,38 @@ function dRenderActionButtons(s) {
   const container = document.getElementById('dmusig2ActionButtons');
   const btns = [];
 
+  // myIndex bilinmiyorsa (henüz pubkey kaydetmemiş) → sadece pubkey kaydet butonu
+  const myIdx    = state.myIndex;           // null = bilinmiyor
+  const isCoord  = state.myRole === 'coordinator';
+  const isKnown  = myIdx !== null;
+
   if (s.state === 'COLLECTING_PUBKEYS') {
-    btns.push(`<button class="btn btn-primary" onclick="dRegisterPubkey()">Pubkey Kaydet</button>`);
+    // Kendi slotu zaten doluysa buton gizle
+    const alreadyRegistered = isKnown && s.participants[myIdx]?.pubkey;
+    if (!alreadyRegistered) {
+      btns.push(`<button class="btn btn-primary" onclick="dRegisterPubkey()">Pubkey Kaydet</button>`);
+    }
   }
   if (s.state === 'COLLECTING_NONCES') {
-    btns.push(`<button class="btn btn-primary" onclick="dSubmitNonce()">Nonce Üret & Gönder</button>`);
+    // Kendi nonce'u yoksa göster
+    const hasNonce = isKnown && s.participants[myIdx]?.pubnonces?.length > 0;
+    if (!hasNonce) {
+      btns.push(`<button class="btn btn-primary" onclick="dSubmitNonce()">Nonce Üret & Gönder</button>`);
+    } else {
+      btns.push(`<span style="color:#8b949e;font-size:0.85em">⌛ Diğer nonce\'lar bekleniyor</span>`);
+    }
   }
   if (s.state === 'COLLECTING_SIGS') {
-    btns.push(`<button class="btn btn-primary" onclick="dSubmitPartialSig()">Kısmi İmza Üret & Gönder</button>`);
+    // Kendi imzası yoksa göster
+    const hasSig = isKnown && s.participants[myIdx]?.partial_sigs?.length > 0;
+    if (!hasSig) {
+      btns.push(`<button class="btn btn-primary" onclick="dSubmitPartialSig()">Kısmi İmza Üret & Gönder</button>`);
+    } else {
+      btns.push(`<span style="color:#8b949e;font-size:0.85em">⌛ Diğer imzalar bekleniyor</span>`);
+    }
   }
   if (s.state === 'SIGNED') {
+    // Phase 2 fix: tüm katılımcılar yayınlayabilir
     btns.push(`<button class="btn btn-orange" onclick="dBroadcast()">⚡ Yayınla</button>`);
   }
   btns.push(`<button class="btn btn-ghost sm" onclick="dRefreshSession()">↺ Güncelle</button>`);
@@ -1002,11 +1352,11 @@ function dRenderActionButtons(s) {
 
 // ── Özel Anahtar Yönetimi ─────────────────────────────────────────────────
 
-function dGenerateSk() {
+async function dGenerateSk() {
   const sk = MuSig2D.generatePrivateKey();
   document.getElementById('dmusig2MySkInput').value = sk;
   const sid = state.dmusig2Session?.id;
-  if (sid) localStorage.setItem(D_SK_KEY(sid), sk);
+  if (sid) await dSaveSkWithPin(sid, sk);
   dUpdatePkDisplay();
   toast('Yeni özel anahtar üretildi', 'success');
 }
@@ -1019,9 +1369,11 @@ function dUpdatePkDisplay() {
     const pkHex = MuSig2D.derivePublicKey(skHex);
     hint.textContent = `Pubkey: ${pkHex}`;
     hint.style.color = '#3fb950';
-    // Oturum açıksa sk'yı kaydet
+    // Oturum açıksa sk'yı kaydet (şifreli kopya yoksa)
     const sid = state.dmusig2Session?.id;
-    if (sid) localStorage.setItem(D_SK_KEY(sid), skHex);
+    if (sid && !localStorage.getItem(D_ENC_SK_KEY(sid))) {
+      localStorage.setItem(D_SK_KEY(sid), skHex);
+    }
   } catch(e) {
     hint.textContent = `Hata: ${e.message}`;
     hint.style.color = '#f85149';
@@ -1047,7 +1399,7 @@ async function dRegisterPubkey() {
     const updated = await post(`/api/musig2d/${s.id}/register`,
       { participant_index: idx, pubkey_hex: pkHex });
     localStorage.setItem(D_IDX_KEY(s.id), String(idx));
-    localStorage.setItem(D_SK_KEY(s.id), skHex);   // sk'yı kaydet — sayfa yenilenmesinde kaybolmasın
+    await dSaveSkWithPin(s.id, skHex);  // PIN varsa şifreli, yoksa düz kaydet
     state.dmusig2Session = updated;
     dRenderSession(updated);
     toast(`Katılımcı ${idx+1} pubkey kaydedildi`, 'success');
@@ -1101,7 +1453,7 @@ async function dSubmitNonce() {
         k2: result.secretNonce.k2.toString(),
       }));
       // Nonce ile kullanılan sk'yı da kaydet — imzalama adımında tutarlılık için
-      localStorage.setItem(D_SK_KEY(s.id), skHex);
+      await dSaveSkWithPin(s.id, skHex);
       pubnonces.push(result.pubNonce);
     }
 
@@ -1159,6 +1511,13 @@ async function dSubmitPartialSig() {
 
     const updated = await post(`/api/musig2d/${s.id}/submit-partial-sig`,
       { participant_index: idx, partial_sigs });
+
+    // Phase 5: Nonce'ları yalnızca başarılı response'da sil (finally'de değil)
+    // Başarısız imzada nonce kaybolmamalı — kullanıcı tekrar deneyebilmeli
+    for (let i = 0; i < s.sighashes.length; i++) {
+      localStorage.removeItem(D_NONCE_KEY(s.id, i));
+    }
+
     state.dmusig2Session = updated;
     dRenderSession(updated);
 
@@ -1170,6 +1529,7 @@ async function dSubmitPartialSig() {
   } catch(e) {
     toast(`Kısmi imza başarısız: ${e.message}`, 'error');
     uiLog(`partial_sig hata: ${e.message}`, 'ERR');
+    // Nonce'lar localStorage'da kaldı — kullanıcı tekrar imzalayabilir
   }
 }
 

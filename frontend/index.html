@@ -35,6 +35,7 @@
         </li>
         <li class="nav-item" data-tab="musig2d">
           <span class="nav-icon">⛓</span><span>Dağıtık MuSig2</span>
+          <sup id="dmusig2NavBadge" style="display:none;background:#f85149;color:#fff;border-radius:8px;padding:1px 5px;font-size:0.7em;margin-left:4px;font-weight:700"></sup>
         </li>
         <li class="nav-item" data-tab="wallets">
           <span class="nav-icon">◻</span><span>Cüzdanlar</span>
@@ -235,6 +236,36 @@
           </p>
         </div>
 
+        <!-- Phase 4: Aksiyon Kuyruğu Dashboard -->
+        <div id="dmusig2Dashboard" style="display:none;margin-bottom:24px">
+
+          <!-- Bekleyen Aksiyonlar -->
+          <div class="section-header" style="margin-bottom:8px">
+            <h2 style="margin:0;font-size:0.92em;letter-spacing:.04em">⚡ Bekleyen Aksiyonlar</h2>
+          </div>
+          <div id="dmusig2DashPending">
+            <div class="empty-state" style="padding:10px 16px;font-size:0.85em">Bekleyen aksiyon yok.</div>
+          </div>
+
+          <!-- İzlemede -->
+          <div class="section-header" style="margin:18px 0 8px">
+            <h2 style="margin:0;font-size:0.92em;letter-spacing:.04em;color:#8b949e">⌛ İzlemede</h2>
+          </div>
+          <div id="dmusig2DashWatching">
+            <div class="empty-state" style="padding:10px 16px;font-size:0.85em">İzlenen oturum yok.</div>
+          </div>
+
+          <!-- Tamamlanan -->
+          <div class="section-header" style="margin:18px 0 8px">
+            <h2 style="margin:0;font-size:0.92em;letter-spacing:.04em;color:#3fb950">✓ Tamamlanan</h2>
+          </div>
+          <div id="dmusig2DashCompleted">
+            <div class="empty-state" style="padding:10px 16px;font-size:0.85em">Tamamlanan oturum yok.</div>
+          </div>
+
+          <hr style="border-color:#21262d;margin:20px 0 16px">
+        </div>
+
         <!-- Oturum Listesi -->
         <div id="dmusig2SessionList">
           <div class="empty-state">Henüz dağıtık MuSig2 oturumu yok.<br>Yeni bir oturum oluşturun.</div>
@@ -254,9 +285,10 @@
               <span>Katılımcı: <strong id="dmusig2N">—</strong></span>
               <span>Ağ: <strong id="dmusig2Network">—</strong></span>
             </div>
-            <div style="margin-top:8px;font-size:0.82em;color:#8b949e">
-              Oturum ID: <code id="dmusig2Sid" style="color:#58a6ff"></code>
-              <button class="btn btn-ghost sm" style="margin-left:8px" onclick="dCopySid()">⎘</button>
+            <div style="margin-top:8px;font-size:0.82em;color:#8b949e;display:flex;gap:16px;flex-wrap:wrap;align-items:center">
+              <span>Oturum ID: <code id="dmusig2Sid" style="color:#58a6ff"></code>
+              <button class="btn btn-ghost sm" style="margin-left:4px" onclick="dCopySid()">⎘</button></span>
+              <span id="dmusig2Expiry" style="display:none">⏱ <span id="dmusig2ExpiryText"></span></span>
             </div>
             <div id="dmusig2CryptoWarning" style="display:none;margin-top:8px;padding:6px 10px;background:#3d2000;border-radius:4px;font-size:0.8em;color:#f0883e">
               ⚠ HTTP bağlamı algılandı — WebCrypto devre dışı. Saf-JS SHA-256 kullanılıyor (fallback aktif).
@@ -302,7 +334,24 @@
               </div>
               <div class="form-hint" id="dmusig2MyPkDisplay" style="font-family:monospace;font-size:0.78em;margin-top:4px;word-break:break-all"></div>
             </div>
+            <!-- 1a: isteğe bağlı PIN şifreleme -->
+            <div class="form-group">
+              <label class="form-label">PIN <span style="color:#8b949e;font-weight:400">(isteğe bağlı — SK'yı şifreleyerek saklar)</span></label>
+              <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                <input class="form-input" id="dmusig2PinInput" type="password"
+                       placeholder="PIN girin veya boş bırakın" style="max-width:200px;font-family:monospace">
+                <button class="btn btn-ghost sm" id="dmusig2UnlockBtn"
+                        onclick="dUnlockSk()" style="display:none">🔓 PIN ile Aç</button>
+                <span id="dmusig2EncSkBadge"
+                      style="display:none;font-size:0.78em;color:#f0883e">🔒 SK şifreli saklanmış</span>
+              </div>
+            </div>
             <div class="action-row" id="dmusig2ActionButtons" style="flex-wrap:wrap;gap:8px"></div>
+          </div>
+
+          <!-- 1c: Katılımcı için koordinatör bekleme mesajı -->
+          <div id="dmusig2CoordWaiting" style="display:none;padding:14px 16px;background:#161b22;border:1px solid #30363d;border-radius:8px;margin-bottom:14px;color:#8b949e;font-size:0.9em">
+            ⌛ Koordinatör TX hazırlıyor, lütfen bekleyin…
           </div>
 
           <!-- TX Parametreleri (READY_FOR_TX — yalnızca koordinatörde) -->

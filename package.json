@@ -1,0 +1,14 @@
+{
+  "name": "musig2-taproot-wallet",
+  "version": "0.1.0",
+  "description": "BIP-327 MuSig2 Taproot 2-of-2 multisig wallet",
+  "license": "MIT",
+  "author": "Alptekin Kekilli <alptekin@kekilli.tr> (https://github.com/alptekinkekilli)",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/alptekinkekilli/taproot-wallet"
+  },
+  "scripts": {
+    "start": "./start.sh"
+  }
+}

@@ -21,11 +21,13 @@ Bitcoin Core v26+ Entegrasyonu:
         importprivkey / importpubkey artık desteklenmez.
 """
 
-import sys, os, uuid, json, secrets as sec_mod, hashlib, struct, hmac as _hmac_mod
+import sys, os, uuid, json, secrets as sec_mod, hashlib, struct, hmac as _hmac_mod, time as _time
+import logging
 from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
+import asyncio
 from pydantic import BaseModel
 
 # btc_examples modülleri
@@ -51,7 +53,13 @@ from src.descriptor_wallet import DescriptorWallet, DescriptorChecksum
 from src.utxo_manager import UTXOManager, CoreUTXO, CoinSelector, build_p2tr_scriptpubkey, parse_p2tr_scriptpubkey
 from src.taproot_signer import TaprootSigner, SighashType
 
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
+
 app = FastAPI(title="Taproot Wallet API", version="1.0.0")
+
+# Phase 5: Oturum TTL — 48 saat
+SESSION_TTL_SECONDS = 48 * 3600
 
 # ── Bitcoin Core RPC Bağlantısı (opsiyonel) ───────────────────────────────────
 #
@@ -75,13 +83,13 @@ if _USE_CORE:
             wallet_name=os.environ.get("BITCOIN_WALLET"),
         )
         info = _core_rpc.health_check()
-        print(f"[Core] Bitcoin Core v26+ bağlandı: chain={info['chain']} "
-              f"blocks={info['blocks']} progress={info['verificationprogress']:.4f}")
+        logger.info("[Core] Bitcoin Core v26+ bağlandı: chain=%s blocks=%s progress=%.4f",
+                    info['chain'], info['blocks'], info['verificationprogress'])
     except RPCConnectionError as e:
-        print(f"[Core] UYARI: Bağlantı kurulamadı, Esplora'ya geçildi.\n  {e}")
+        logger.warning("[Core] Bağlantı kurulamadı, Esplora'ya geçildi: %s", e)
         _core_rpc = None
     except RPCError as e:
-        print(f"[Core] UYARI: RPC hatası, Esplora'ya geçildi.\n  {e}")
+        logger.warning("[Core] RPC hatası, Esplora'ya geçildi: %s", e)
         _core_rpc = None
 
 
@@ -154,10 +162,10 @@ def _migrate_dmusig2_session(s: dict) -> bool:
             pk_list_bytes = [bytes.fromhex(pk) for pk in s["pk_list_sorted"]]
             Q_m, _ = key_aggregation(pk_list_bytes)
             s["agg_q_even_y"] = (Q_m.y % 2 == 0)
-            print(f"[MIGRATE] Session {s.get('id')} backfilled agg_q_even_y={s['agg_q_even_y']}", file=sys.stderr)
+            logger.info("[MIGRATE] Session %s backfilled agg_q_even_y=%s", s.get('id'), s['agg_q_even_y'])
             return True
         except Exception as exc:
-            print(f"[MIGRATE] Session {s.get('id')} migration failed: {exc}", file=sys.stderr)
+            logger.warning("[MIGRATE] Session %s migration failed: %s", s.get('id'), exc)
     return False
 
 def _load_dmusig2() -> Dict[str, Dict]:
@@ -1315,6 +1323,7 @@ def create_dmusig2_session(req: DMusig2Create):
         "description": "",
         "tx_hex": None,
         "final_sig": None,
+        "created_at": int(_time.time()),   # Phase 5: TTL hesabı için
     }
     _save_dmusig2()
     return dmusig2_sessions[sid]
@@ -1323,6 +1332,107 @@ def create_dmusig2_session(req: DMusig2Create):
 @app.get("/api/musig2d/list")
 def list_dmusig2():
     return list(dmusig2_sessions.values())
+
+
+@app.get("/api/musig2d/actions")
+def dmusig2_actions(pubkey: str):
+    """
+    Verilen pubkey'in (33-byte compressed hex) tüm oturumlardaki
+    bekleyen aksiyonlarını döner.
+
+    Her eleman:
+      { session_id, label, network, state, participant_index, action }
+
+    action değerleri (aktif):
+      "build_tx"           — koordinatör, TX henüz oluşturulmamış
+      "submit_nonce"       — nonce henüz gönderilmemiş
+      "submit_partial_sig" — kısmi imza henüz gönderilmemiş
+      "broadcast"          — TX imzalandı, yayınlanabilir (tüm katılımcılar)
+
+    action değerleri (bekleme):
+      "wait_pubkeys"       — diğer katılımcıların pubkey kaydını bekliyor
+      "wait_coordinator"   — koordinatörün TX oluşturmasını bekliyor
+      "wait_nonce"         — diğerlerinin nonce göndermesini bekliyor
+      "wait_sig"           — diğerlerinin imzasını bekliyor
+      "done"               — oturum tamamlandı
+    """
+    pubkey = pubkey.strip().lower()
+    if len(pubkey) != 66:
+        raise HTTPException(400, "pubkey 33-byte compressed hex (66 karakter) olmalı")
+
+    def _nonces_missing(p: dict) -> bool:
+        """Katılımcının nonce'u eksik mi? Multi-input ve None-filled listeleri de yakalar."""
+        nonces = p.get("pubnonces") or []
+        return not nonces or any(n is None for n in nonces)
+
+    def _sigs_missing(p: dict) -> bool:
+        """Katılımcının kısmi imzası eksik mi? Multi-input ve None-filled listeleri de yakalar."""
+        sigs = p.get("partial_sigs") or []
+        return not sigs or any(sig is None for sig in sigs)
+
+    now = _time.time()
+    results = []
+    for s in dmusig2_sessions.values():
+        # Phase 5: Süresi dolmuş oturumları /actions'dan gizle
+        created_at = s.get("created_at", now)  # eski oturumlar için şimdiki zaman → hemen expire etme
+        expires_at = created_at + SESSION_TTL_SECONDS
+        if now > expires_at:
+            continue
+
+        for p in s["participants"]:
+            if p.get("pubkey") != pubkey:
+                continue
+
+            idx   = p["index"]
+            state = s["state"]
+
+            if state == "COLLECTING_PUBKEYS":
+                # Kendi pubkey'i zaten kayıtlı (bu satıra geldik), diğerlerini bekliyor
+                action = "wait_pubkeys"
+
+            elif state == "READY_FOR_TX":
+                # Koordinatör (idx=0) TX oluşturmalı; diğerleri bekliyor
+                action = "build_tx" if idx == 0 else "wait_coordinator"
+
+            elif state == "COLLECTING_NONCES":
+                action = "submit_nonce" if _nonces_missing(p) else "wait_nonce"
+
+            elif state == "COLLECTING_SIGS":
+                action = "submit_partial_sig" if _sigs_missing(p) else "wait_sig"
+
+            elif state == "SIGNED":
+                # Herhangi bir katılımcı broadcast yapabilir (koordinatör offline olabilir)
+                action = "broadcast"
+
+            else:  # BROADCAST veya bilinmeyen
+                action = "done"
+
+            # Participant-level nonce/sig özeti — frontend diff için
+            participants_summary = [
+                {
+                    "index": pp["index"],
+                    "label": pp["label"],
+                    "has_nonce": bool(pp.get("pubnonces") and
+                                     any(n is not None for n in pp["pubnonces"])),
+                    "has_sig":   bool(pp.get("partial_sigs") and
+                                     any(sg is not None for sg in pp["partial_sigs"])),
+                }
+                for pp in s["participants"]
+            ]
+
+            results.append({
+                "session_id":        s["id"],
+                "label":             s["label"],
+                "network":           s["network"],
+                "state":             state,
+                "participant_index": idx,
+                "action":            action,
+                "participants":      participants_summary,
+                "expires_at":        int(expires_at),   # Unix timestamp
+            })
+            break  # bir oturumda en fazla bir eşleşme
+
+    return results
 
 
 @app.get("/api/musig2d/{sid}")
@@ -1378,8 +1488,7 @@ def dmusig2_register(sid: str, req: DMusig2Register):
         s["agg_q_even_y"] = (Q.y % 2 == 0)
         s["agg_address"] = agg_address
         s["state"] = "READY_FOR_TX"
-        import sys
-        print(f"[DEBUG register] Session {sid}: agg_q_even_y={s['agg_q_even_y']}, Q.y={hex(Q.y)}", file=sys.stderr)
+        logger.debug("[register] Session %s: agg_q_even_y=%s, Q.y=%s", sid, s['agg_q_even_y'], hex(Q.y))
 
     _save_dmusig2()
     return s
@@ -1577,21 +1686,19 @@ def dmusig2_submit_sig(sid: str, req: DMusig2SubmitSig):
                 for p in s["participants"]
             ]
 
-            import sys
             q_even_actual = (Q.y % 2 == 0)
-            print(f"[DEBUG submit-partial-sig] Input {i}", file=sys.stderr)
-            print(f"  sighash         : {sighash.hex()}", file=sys.stderr)
-            print(f"  agg_xonly       : {s['agg_xonly']}", file=sys.stderr)
-            print(f"  Q_even_y actual : {q_even_actual}  (stored: {s.get('agg_q_even_y')})", file=sys.stderr)
-            print(f"  R.x             : {R.x.to_bytes(32,'big').hex()}", file=sys.stderr)
-            print(f"  R_even_y        : {R.y % 2 == 0}", file=sys.stderr)
-            print(f"  b (noncecoef)   : {hex(b)}", file=sys.stderr)
-            for pi, p in enumerate(s["participants"]):
-                print(f"  partial_sig[{pi}] : {p['partial_sigs'][i]}", file=sys.stderr)
-                print(f"  pubkey[{pi}]      : {p.get('pubkey','?')}", file=sys.stderr)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("[submit-partial-sig] Input %d sighash=%s agg_xonly=%s "
+                             "Q_even_y=%s(stored=%s) R.x=%s R_even_y=%s b=%s",
+                             i, sighash.hex(), s['agg_xonly'],
+                             q_even_actual, s.get('agg_q_even_y'),
+                             R.x.to_bytes(32,'big').hex(), R.y % 2 == 0, hex(b))
+                for pi, p in enumerate(s["participants"]):
+                    logger.debug("  partial_sig[%d]=%s pubkey[%d]=%s",
+                                 pi, p['partial_sigs'][i], pi, p.get('pubkey','?'))
 
             final_sig = partial_sig_agg(partial_sigs_i, R)
-            print(f"  final_sig : {final_sig.hex()}", file=sys.stderr)
+            logger.debug("[submit-partial-sig] final_sig=%s", final_sig.hex())
 
             if not schnorr_verify(sighash, _xonly(Q), final_sig):
                 detail = (
@@ -1634,6 +1741,103 @@ def dmusig2_broadcast(sid: str):
         raise HTTPException(400, f"Yayınlama başarısız: {err}")
     except Exception as e:
         raise HTTPException(500, f"Bağlantı hatası: {e}")
+
+
+# ── Phase 6: SSE — Session Olay Akışı (Placeholder) ──────────────────────────
+
+def _sse_participants_snapshot(s: dict) -> str:
+    """Katılımcı nonce/sig durumunun karşılaştırma string'i — değişim tespiti için."""
+    parts = [
+        f"{p['index']}:{bool(p.get('pubnonces'))}:{bool(p.get('partial_sigs'))}"
+        for p in s.get("participants", [])
+    ]
+    return "|".join(parts)
+
+
+async def _sse_generator(sid: str):
+    """
+    SSE async generator — Phase 6 placeholder.
+
+    Protokol:
+      event: connected  — bağlantı kuruldu, ilk durum gönderildi
+      event: update     — session state veya katılımcı verisi değişti
+      : heartbeat       — 15s'de bir keepalive (yorum satırı, event değil)
+      event: deleted    — oturum silindi veya bulunamadı
+
+    Disconnect: client bağlantıyı koparınca Starlette async generator'ı
+    kapatır → GeneratorExit fırlatılır → finally bloğu garantili çalışır.
+    """
+    HEARTBEAT_INTERVAL = 15   # saniye
+    POLL_INTERVAL      = 2    # saniye — in-memory store polling
+
+    s = dmusig2_sessions.get(sid)
+    if not s:
+        yield f"event: deleted\ndata: {json.dumps({'detail': 'Oturum bulunamadı'})}\n\n"
+        return
+
+    last_state        = s["state"]
+    last_participants = _sse_participants_snapshot(s)
+    ticks_since_hb    = 0   # heartbeat sayacı
+
+    # İlk mesaj — client bağlandı, mevcut durum
+    yield f"event: connected\ndata: {json.dumps({'session_id': sid, 'state': last_state})}\n\n"
+
+    try:
+        while True:
+            await asyncio.sleep(POLL_INTERVAL)   # blocking değil — await
+            ticks_since_hb += POLL_INTERVAL
+
+            s = dmusig2_sessions.get(sid)
+            if not s:
+                yield f"event: deleted\ndata: {json.dumps({'session_id': sid})}\n\n"
+                return
+
+            current_state        = s["state"]
+            current_participants = _sse_participants_snapshot(s)
+
+            if current_state != last_state or current_participants != last_participants:
+                last_state        = current_state
+                last_participants = current_participants
+                ticks_since_hb    = 0   # güncelleme heartbeat yerine geçer
+                payload = json.dumps({"session_id": sid, "state": current_state})
+                yield f"event: update\ndata: {payload}\n\n"
+
+            elif ticks_since_hb >= HEARTBEAT_INTERVAL:
+                # Değişim yoksa keepalive — SSE yorum satırı olarak gönderilir,
+                # tarayıcı bunu event olarak işlemez, yalnızca bağlantıyı açık tutar
+                yield ": heartbeat\n\n"
+                ticks_since_hb = 0
+
+    except GeneratorExit:
+        # Client bağlantıyı kapattı — temiz çıkış, kaynak serbest bırakılır
+        pass
+    finally:
+        # Gelecekte abonelik kaydı / cleanup buraya gelir
+        pass
+
+
+@app.get("/api/musig2d/{sid}/events")
+async def dmusig2_events(sid: str):
+    """
+    SSE endpoint — session güncellemelerini gerçek zamanlı push eder.
+
+    Phase 6 placeholder: polling tabanlı in-memory store izleme.
+    Gelecekte: asyncio.Queue veya pub/sub ile gerçek push mimarisine geçilecek.
+
+    Headers:
+      Cache-Control: no-cache       — proxy cache'ini engelle
+      X-Accel-Buffering: no         — nginx buffer'ını devre dışı bırak
+      Connection: keep-alive        — bağlantının açık kalmasını zorla
+    """
+    return StreamingResponse(
+        _sse_generator(sid),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":    "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection":       "keep-alive",
+        },
+    )
 
 
 # ── Static Files ──────────────────────────────────────────────────────────────
