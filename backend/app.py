@@ -145,11 +145,32 @@ musig2_sessions: Dict[str, Dict] = _load_musig2()
 
 _DMUSIG2_F = os.path.join(_DATA_DIR, "dmusig2_sessions.json")
 
+def _migrate_dmusig2_session(s: dict) -> bool:
+    """Backfill agg_q_even_y for sessions created before this field was added.
+    Returns True if the session was modified."""
+    import sys
+    if s.get("agg_q_even_y") is None and s.get("pk_list_sorted"):
+        try:
+            pk_list_bytes = [bytes.fromhex(pk) for pk in s["pk_list_sorted"]]
+            Q_m, _ = key_aggregation(pk_list_bytes)
+            s["agg_q_even_y"] = (Q_m.y % 2 == 0)
+            print(f"[MIGRATE] Session {s.get('id')} backfilled agg_q_even_y={s['agg_q_even_y']}", file=sys.stderr)
+            return True
+        except Exception as exc:
+            print(f"[MIGRATE] Session {s.get('id')} migration failed: {exc}", file=sys.stderr)
+    return False
+
 def _load_dmusig2() -> Dict[str, Dict]:
     if os.path.exists(_DMUSIG2_F):
         try:
             with open(_DMUSIG2_F, "r") as f:
-                return json.load(f)
+                data = json.load(f)
+            # Migrate old sessions that lack agg_q_even_y
+            migrated = sum(1 for s in data.values() if _migrate_dmusig2_session(s))
+            if migrated:
+                with open(_DMUSIG2_F, "w") as fw:
+                    json.dump(data, fw, indent=2)
+            return data
         except Exception:
             return {}
     return {}
@@ -1309,6 +1330,9 @@ def get_dmusig2_session(sid: str):
     s = dmusig2_sessions.get(sid)
     if not s:
         raise HTTPException(404, "Oturum bulunamadı")
+    # Backfill agg_q_even_y for sessions loaded from disk before this field existed
+    if _migrate_dmusig2_session(s):
+        _save_dmusig2()
     return s
 
 
@@ -1351,9 +1375,11 @@ def dmusig2_register(sid: str, req: DMusig2Register):
         agg_address = _bech32m_encode("tb" if testnet else "bc", _xonly(Q))
         s["pk_list_sorted"] = [b.hex() for b in pk_list_bytes]
         s["agg_xonly"] = _xonly(Q).hex()
-        s["agg_q_even_y"] = (Q.y % 2 == 0)   # BUG FIX: tell frontend whether Q has even Y
+        s["agg_q_even_y"] = (Q.y % 2 == 0)
         s["agg_address"] = agg_address
         s["state"] = "READY_FOR_TX"
+        import sys
+        print(f"[DEBUG register] Session {sid}: agg_q_even_y={s['agg_q_even_y']}, Q.y={hex(Q.y)}", file=sys.stderr)
 
     _save_dmusig2()
     return s
@@ -1552,15 +1578,16 @@ def dmusig2_submit_sig(sid: str, req: DMusig2SubmitSig):
             ]
 
             import sys
+            q_even_actual = (Q.y % 2 == 0)
             print(f"[DEBUG submit-partial-sig] Input {i}", file=sys.stderr)
-            print(f"  sighash   : {sighash.hex()}", file=sys.stderr)
-            print(f"  agg_xonly : {s['agg_xonly']}", file=sys.stderr)
-            print(f"  Q even_y  : {s.get('agg_q_even_y')}", file=sys.stderr)
-            print(f"  R.x       : {R.x.to_bytes(32,'big').hex()}", file=sys.stderr)
-            print(f"  R even_y  : {R.y % 2 == 0}", file=sys.stderr)
-            print(f"  b (noncecoef): {hex(b)}", file=sys.stderr)
+            print(f"  sighash         : {sighash.hex()}", file=sys.stderr)
+            print(f"  agg_xonly       : {s['agg_xonly']}", file=sys.stderr)
+            print(f"  Q_even_y actual : {q_even_actual}  (stored: {s.get('agg_q_even_y')})", file=sys.stderr)
+            print(f"  R.x             : {R.x.to_bytes(32,'big').hex()}", file=sys.stderr)
+            print(f"  R_even_y        : {R.y % 2 == 0}", file=sys.stderr)
+            print(f"  b (noncecoef)   : {hex(b)}", file=sys.stderr)
             for pi, p in enumerate(s["participants"]):
-                print(f"  partial_sig[{pi}]: {p['partial_sigs'][i]}", file=sys.stderr)
+                print(f"  partial_sig[{pi}] : {p['partial_sigs'][i]}", file=sys.stderr)
                 print(f"  pubkey[{pi}]      : {p.get('pubkey','?')}", file=sys.stderr)
 
             final_sig = partial_sig_agg(partial_sigs_i, R)
@@ -1568,11 +1595,11 @@ def dmusig2_submit_sig(sid: str, req: DMusig2SubmitSig):
 
             if not schnorr_verify(sighash, _xonly(Q), final_sig):
                 detail = (
-                    f"Input {i} Schnorr doğrulaması başarısız — "
-                    f"kısmi imza hatalı. "
-                    f"Q_even_y={s.get('agg_q_even_y')}, "
+                    f"Input {i} Schnorr doğrulaması başarısız. "
+                    f"Q_even_y(actual)={q_even_actual}, "
+                    f"Q_even_y(stored)={s.get('agg_q_even_y')}, "
                     f"R_even_y={R.y % 2 == 0}. "
-                    f"Backend loglarına bakın."
+                    f"Eski oturum ise yeni oturum açın."
                 )
                 raise HTTPException(400, detail)
 
