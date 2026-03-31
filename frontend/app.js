@@ -1047,6 +1047,7 @@ async function dRegisterPubkey() {
     const updated = await post(`/api/musig2d/${s.id}/register`,
       { participant_index: idx, pubkey_hex: pkHex });
     localStorage.setItem(D_IDX_KEY(s.id), String(idx));
+    localStorage.setItem(D_SK_KEY(s.id), skHex);   // sk'yı kaydet — sayfa yenilenmesinde kaybolmasın
     state.dmusig2Session = updated;
     dRenderSession(updated);
     toast(`Katılımcı ${idx+1} pubkey kaydedildi`, 'success');
@@ -1099,6 +1100,8 @@ async function dSubmitNonce() {
         k1: result.secretNonce.k1.toString(),
         k2: result.secretNonce.k2.toString(),
       }));
+      // Nonce ile kullanılan sk'yı da kaydet — imzalama adımında tutarlılık için
+      localStorage.setItem(D_SK_KEY(s.id), skHex);
       pubnonces.push(result.pubNonce);
     }
 
