@@ -31,7 +31,8 @@ taproot/
 | P2TR adresi | BIP-341 key-path tweak uygulanmış |
 | HD cüzdan | BIP-32 + BIP-86 (`m/86'/coin_type'/0'`) |
 | Sparrow uyumu | `tpub` descriptor + `tprv` imzalama anahtarı |
-| MuSig2 | n-of-n Schnorr multisig oturumu |
+| MuSig2 | n-of-n Schnorr multisig oturumu (tek-makine simülasyon) |
+| **Dağıtık MuSig2** | **BIP-327 iki turlu protokol — özel anahtarlar tarayıcıda kalır** |
 | Testnet4 | Mempool.space Esplora API |
 | Bitcoin Core | `importdescriptors` ile izleme |
 
@@ -151,6 +152,64 @@ curl --user user:pass --data-binary \
 
 ---
 
+## Dağıtık MuSig2 (BIP-327)
+
+İki veya daha fazla katılımcı, özel anahtarlarını paylaşmadan ortak bir Taproot
+adresi oluşturur ve işlem imzalar. Backend yalnızca koordinatör rolündedir.
+
+### Mimari
+
+```
+Tarayıcı A (Katılımcı 1)          Tarayıcı B (Katılımcı 2)
+─────────────────────────          ─────────────────────────
+özel anahtar: localStorage         özel anahtar: localStorage
+pubkey → backend                   pubkey → backend
+nonce  → backend                   nonce  → backend
+kısmi imza → backend               kısmi imza → backend
+                 │                              │
+                 └────────── Backend ───────────┘
+                       (koordinatör, koordine eder)
+                       agg_nonce, agg_key hesaplar
+                       Schnorr doğrulama yapar
+                       tx_hex üretir
+```
+
+### 2-of-2 İmzalama Akışı
+
+```
+1. Koordinatör yeni oturum açar (N=2)
+2. Her iki taraf pubkey kaydeder → agg_address oluşur (READY_FOR_TX)
+3. Koordinatör TX oluşturur (alıcı, miktar) → sighash hesaplanır (COLLECTING_NONCES)
+4. Her iki taraf nonce üretip gönderir → agg_nonce hesaplanır (COLLECTING_SIGS)
+5. Her iki taraf kısmi imza gönderir → backend Schnorr doğrulama yapar (SIGNED)
+6. Herhangi bir taraf TX'i yayınlar → TXID döner (BROADCAST)
+```
+
+### Güvenlik Modeli
+
+- Özel anahtarlar **asla** sunucuya gönderilmez; yalnızca `pubkey`, `pubnonce`, `partial_sig` iletilir
+- Tüm kriptografi tarayıcıda çalışır (`musig2d.js`): BIP-327 uyumlu saf-JS implementasyon
+- HTTP bağlamında `WebCrypto` yerine saf-JS SHA-256 fallback kullanılır (LAN erişimi desteği)
+- Nonce'lar `localStorage`'da saklanır; sayfa yenilenmeden önce imzalama tamamlanmalıdır
+
+### Dağıtık API Uç Noktaları
+
+| Metod | Yol | Açıklama |
+|-------|-----|---------|
+| POST | `/api/musig2d/new` | Yeni oturum oluştur |
+| GET | `/api/musig2d/list` | Tüm oturumları listele |
+| GET | `/api/musig2d/{sid}` | Oturum detayı |
+| DELETE | `/api/musig2d/{sid}` | Oturumu sil |
+| POST | `/api/musig2d/{sid}/register` | Pubkey kaydet |
+| POST | `/api/musig2d/{sid}/build-tx` | TX oluştur / sighash hesapla |
+| POST | `/api/musig2d/{sid}/submit-nonce` | Pubnonce gönder |
+| POST | `/api/musig2d/{sid}/submit-partial-sig` | Kısmi imza gönder |
+| POST | `/api/musig2d/{sid}/broadcast` | TX yayınla |
+
+Swagger: **http://localhost:8000/docs**
+
+---
+
 ## Güvenlik Uyarıları
 
 - Private key'ler `backend/data/wallets.json` içinde **şifresiz** saklanır
@@ -158,3 +217,9 @@ curl --user user:pass --data-binary \
 - Yalnızca **testnet** kullanımı içindir; mainnet'te bağımsız güvenlik denetimi şart
 - `bip341-test` gibi eski (tweaksız-olmayan) wallet'lar Sparrow ile uyumlu değildir;
   `hd: true` flag'li yeni wallet'lara geçiş önerilir
+
+---
+
+## Lisans
+
+MIT — bkz. [LICENSE](LICENSE)

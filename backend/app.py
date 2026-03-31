@@ -1282,6 +1282,7 @@ def create_dmusig2_session(req: DMusig2Create):
         "participants": participants,
         "pk_list_sorted": [],
         "agg_xonly": None,
+        "agg_q_even_y": None,   # True if aggregate Q has even Y — frontend needs this for d-negation
         "agg_address": None,
         "agg_nonces": [],     # [{r1: hex, r2: hex}, ...] per input
         "sighashes": [],      # [hex, ...] per input
@@ -1350,6 +1351,7 @@ def dmusig2_register(sid: str, req: DMusig2Register):
         agg_address = _bech32m_encode("tb" if testnet else "bc", _xonly(Q))
         s["pk_list_sorted"] = [b.hex() for b in pk_list_bytes]
         s["agg_xonly"] = _xonly(Q).hex()
+        s["agg_q_even_y"] = (Q.y % 2 == 0)   # BUG FIX: tell frontend whether Q has even Y
         s["agg_address"] = agg_address
         s["state"] = "READY_FOR_TX"
 
@@ -1542,16 +1544,37 @@ def dmusig2_submit_sig(sid: str, req: DMusig2SubmitSig):
             agg_R1 = point_from_bytes(bytes.fromhex(agg_nonce_i["r1"]))
             agg_R2 = point_from_bytes(bytes.fromhex(agg_nonce_i["r2"]))
             agg_nonce_pt = (agg_R1, agg_R2)
-            R, _ = session_ctx(agg_nonce_pt, Q, sighash)
+            R, b = session_ctx(agg_nonce_pt, Q, sighash)
 
             partial_sigs_i = [
                 int.from_bytes(bytes.fromhex(p["partial_sigs"][i]), "big")
                 for p in s["participants"]
             ]
+
+            import sys
+            print(f"[DEBUG submit-partial-sig] Input {i}", file=sys.stderr)
+            print(f"  sighash   : {sighash.hex()}", file=sys.stderr)
+            print(f"  agg_xonly : {s['agg_xonly']}", file=sys.stderr)
+            print(f"  Q even_y  : {s.get('agg_q_even_y')}", file=sys.stderr)
+            print(f"  R.x       : {R.x.to_bytes(32,'big').hex()}", file=sys.stderr)
+            print(f"  R even_y  : {R.y % 2 == 0}", file=sys.stderr)
+            print(f"  b (noncecoef): {hex(b)}", file=sys.stderr)
+            for pi, p in enumerate(s["participants"]):
+                print(f"  partial_sig[{pi}]: {p['partial_sigs'][i]}", file=sys.stderr)
+                print(f"  pubkey[{pi}]      : {p.get('pubkey','?')}", file=sys.stderr)
+
             final_sig = partial_sig_agg(partial_sigs_i, R)
+            print(f"  final_sig : {final_sig.hex()}", file=sys.stderr)
 
             if not schnorr_verify(sighash, _xonly(Q), final_sig):
-                raise HTTPException(500, f"Input {i} Schnorr doğrulaması başarısız — kısmi imza hatalı")
+                detail = (
+                    f"Input {i} Schnorr doğrulaması başarısız — "
+                    f"kısmi imza hatalı. "
+                    f"Q_even_y={s.get('agg_q_even_y')}, "
+                    f"R_even_y={R.y % 2 == 0}. "
+                    f"Backend loglarına bakın."
+                )
+                raise HTTPException(400, detail)
 
             all_final_sigs.append(final_sig)
 

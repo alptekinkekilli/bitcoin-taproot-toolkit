@@ -30,6 +30,13 @@ private_keys.txt
 backend/data/
 *.descriptor
 
+# Node
+node_modules/
+dist/
+
+# Logs
+*.log
+
 # OS
 .DS_Store
 Thumbs.db

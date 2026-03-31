@@ -1145,8 +1145,11 @@ async function dSubmitPartialSig() {
       const aggNonce = s.agg_nonces[i];   // {r1: hex33, r2: hex33}
       const sighash  = s.sighashes[i];    // 32-byte hex
 
+      // agg_q_even_y: sent by backend; tells us whether key_aggregation Q has even Y.
+      // When Q has odd Y, d must be negated so the sig verifies against lift_x(Q.x).
+      const qEvenY = s.agg_q_even_y !== false;   // default true for old sessions
       const sigHex = await MuSig2D.partialSign(
-        secretNonce, skHex, coeff, s.agg_xonly, aggNonce, sighash
+        secretNonce, skHex, coeff, s.agg_xonly, aggNonce, sighash, qEvenY
       );
       partial_sigs.push(sigHex);
     }

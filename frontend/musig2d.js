@@ -273,7 +273,15 @@ const MuSig2D = (() => {
 
   // ── BIP-327 Kısmi İmzalama ────────────────────────────────────────────────
 
-  async function partialSign(secretNonce, skHex, coeffBigint, aggXonlyHex, aggNonce, msgHex) {
+  /**
+   * qEvenY: whether the aggregate public key Q (from key_aggregation) has even Y.
+   * Backend stores this as session.agg_q_even_y.
+   * When Q has odd Y, each participant's private key must be negated (d → N - d)
+   * so that the signing corresponds to lift_x(Q.x) used by Schnorr verification.
+   * BUG FIX: previously Q was always reconstructed with even-Y here, so this
+   * negation never triggered — causing ~50% signature failures.
+   */
+  async function partialSign(secretNonce, skHex, coeffBigint, aggXonlyHex, aggNonce, msgHex, qEvenY = true) {
     if (!secretNonce || typeof secretNonce.k1 !== 'bigint' || typeof secretNonce.k2 !== 'bigint')
       throw new Error('partialSign: secretNonce {k1, k2} BigInt çifti gerekli');
     if (typeof skHex !== 'string' || skHex.length !== 64)
@@ -316,7 +324,7 @@ const MuSig2D = (() => {
     let k1eff = k1;
     let k2eff = k2;
 
-    if (!hasEvenY(Q)) d     = modn(N - d);
+    if (!qEvenY)      d     = modn(N - d);        // BUG FIX: use actual Q parity from backend
     if (!hasEvenY(R)) { k1eff = modn(N - k1); k2eff = modn(N - k2); }
 
     const si = modn(k1eff + b * k2eff + e * coeffBigint * d);
