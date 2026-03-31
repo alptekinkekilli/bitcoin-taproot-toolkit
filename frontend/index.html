@@ -258,6 +258,9 @@
               Oturum ID: <code id="dmusig2Sid" style="color:#58a6ff"></code>
               <button class="btn btn-ghost sm" style="margin-left:8px" onclick="dCopySid()">⎘</button>
             </div>
+            <div id="dmusig2CryptoWarning" style="display:none;margin-top:8px;padding:6px 10px;background:#3d2000;border-radius:4px;font-size:0.8em;color:#f0883e">
+              ⚠ HTTP bağlamı algılandı — WebCrypto devre dışı. Saf-JS SHA-256 kullanılıyor (fallback aktif).
+            </div>
           </div>
 
           <!-- Agrege Adres -->
@@ -302,9 +305,13 @@
             <div class="action-row" id="dmusig2ActionButtons" style="flex-wrap:wrap;gap:8px"></div>
           </div>
 
-          <!-- TX Parametreleri (READY_FOR_TX) -->
+          <!-- TX Parametreleri (READY_FOR_TX — yalnızca koordinatörde) -->
           <div class="card" id="dmusig2TxCard" style="display:none">
-            <div class="form-label" style="margin-bottom:10px">Transaction Oluştur</div>
+            <div class="form-label" style="margin-bottom:10px">Transaction Oluştur (Koordinatör)</div>
+            <div class="form-group">
+              <label class="form-label">Açıklama / İşlem Nedeni</label>
+              <input class="form-input" id="dmusig2TxDesc" placeholder="Örn: Araç taksit ödemesi — Mart 2026">
+            </div>
             <div class="form-group">
               <label class="form-label">Alıcı Adres</label>
               <input class="form-input" id="dmusig2TxTo" placeholder="tb1p...">
@@ -319,6 +326,42 @@
             </div>
             <div class="action-row">
               <button class="btn btn-primary" onclick="dBuildTx()">Sighash Hesapla</button>
+            </div>
+          </div>
+
+          <!-- İşlem Detayları (tüm katılımcılara gösterilir — COLLECTING_NONCES ve sonrası) -->
+          <div class="card" id="dmusig2TxDetails" style="display:none;border-color:#388bfd44">
+            <div class="form-label" style="color:#58a6ff;margin-bottom:12px">
+              İmzalanacak İşlem Detayları
+            </div>
+            <div class="tx-detail-grid">
+              <div class="tx-detail-row">
+                <span>Açıklama</span>
+                <span id="dmusig2DetailsDesc" style="color:#e6edf3;font-style:italic">—</span>
+              </div>
+              <div class="tx-detail-row">
+                <span>Hedef Adres</span>
+                <span id="dmusig2DetailsTo" class="mono-sm" style="font-size:0.8em;word-break:break-all">—</span>
+              </div>
+              <div class="tx-detail-row">
+                <span>Gönderilecek Tutar</span>
+                <span id="dmusig2DetailsAmount" style="color:#3fb950;font-weight:600">—</span>
+              </div>
+              <div class="tx-detail-row">
+                <span>Ağ Ücreti</span>
+                <span id="dmusig2DetailsFee">—</span>
+              </div>
+              <div class="tx-detail-row">
+                <span>Para Üstü</span>
+                <span id="dmusig2DetailsChange" style="color:#8b949e">—</span>
+              </div>
+              <div class="tx-detail-row">
+                <span>Adres Bakiyesi</span>
+                <span id="dmusig2DetailsBalance" style="color:#8b949e">—</span>
+              </div>
+            </div>
+            <div style="margin-top:10px;padding:8px 10px;background:#0d1117;border-radius:4px;font-size:0.78em;color:#8b949e">
+              Bu bilgileri imzalamadan önce doğrulayın. İmza verildikten sonra işlem geri alınamaz.
             </div>
           </div>
 

@@ -889,11 +889,18 @@ function dRenderSession(s) {
   document.getElementById('dmusig2Network').textContent     = s.network;
   document.getElementById('dmusig2Sid').textContent         = s.id;
 
-  // Agrege adres kartı
+  // Fix 1: Güvenli bağlam uyarısı
+  const cryptoStatus = MuSig2D.secureContextStatus();
+  document.getElementById('dmusig2CryptoWarning').style.display =
+    cryptoStatus.hasWebCrypto ? 'none' : '';
+
+  // Agrege adres kartı — Fix 4: otomatik bakiye çek
   const aggCard = document.getElementById('dmusig2AggCard');
   if (s.agg_address) {
     aggCard.style.display = '';
     document.getElementById('dmusig2AggAddr').textContent = s.agg_address;
+    // Fix 4: bakiyeyi her render'da otomatik güncelle
+    dRefreshBalance();
   } else {
     aggCard.style.display = 'none';
   }
@@ -908,15 +915,24 @@ function dRenderSession(s) {
       <td>${i+1}</td>
       <td>${p.label}</td>
       <td class="mono-sm" style="font-size:0.78em">${pkShort}</td>
-      <td>${nonceOk ? '✓' : '—'}</td>
-      <td>${sigOk ? '✓' : '—'}</td>
+      <td>${nonceOk ? '<span style="color:#3fb950">✓</span>' : '—'}</td>
+      <td>${sigOk   ? '<span style="color:#3fb950">✓</span>' : '—'}</td>
     </tr>`;
   }).join('');
 
-  // Katılımcı seçici güncelle
+  // Fix 2: Katılımcı seçici — kayıtlı index'i yükle ve kilitle
   const idxSel = document.getElementById('dmusig2MyIndex');
+  const savedIdx = localStorage.getItem(D_IDX_KEY(s.id));
   idxSel.innerHTML = s.participants.map((p, i) =>
     `<option value="${i}">${p.label}</option>`).join('');
+  if (savedIdx !== null) {
+    idxSel.value = savedIdx;
+    idxSel.disabled = true;  // kimlik kilitlendi
+    idxSel.title = 'Pubkey kaydedildi — katılımcı kimliği kilitli';
+  } else {
+    idxSel.disabled = false;
+    idxSel.title = '';
+  }
 
   // Mevcut sk'yı yükle (varsa)
   const savedSk = localStorage.getItem(D_SK_KEY(s.id));
@@ -925,9 +941,30 @@ function dRenderSession(s) {
     dUpdatePkDisplay();
   }
 
-  // TX kartı
-  const txCard = document.getElementById('dmusig2TxCard');
-  txCard.style.display = s.state === 'READY_FOR_TX' ? '' : 'none';
+  // Fix 3: TX detay paneli — build-tx sonrası tüm katılımcılara göster
+  const txDetails = document.getElementById('dmusig2TxDetails');
+  const showDetails = ['COLLECTING_NONCES','COLLECTING_SIGS','SIGNED','BROADCAST'].includes(s.state)
+                      && s.to_address;
+  if (showDetails) {
+    txDetails.style.display = '';
+    const amtBtc = (s.amount_sat / 1e8).toFixed(8);
+    const feeBtc = (s.fee_sat / 1e8).toFixed(8);
+    document.getElementById('dmusig2DetailsDesc').textContent =
+      s.description || '(açıklama girilmemiş)';
+    document.getElementById('dmusig2DetailsTo').textContent   = s.to_address;
+    document.getElementById('dmusig2DetailsAmount').textContent =
+      `${s.amount_sat.toLocaleString()} sat  (${amtBtc} BTC)`;
+    document.getElementById('dmusig2DetailsFee').textContent  =
+      `${s.fee_sat.toLocaleString()} sat  (${feeBtc} BTC)`;
+    document.getElementById('dmusig2DetailsChange').textContent =
+      s.change_sat > 0 ? `${s.change_sat.toLocaleString()} sat (para üstü — geri gelir)` : 'Yok';
+  } else {
+    txDetails.style.display = 'none';
+  }
+
+  // TX kartı — yalnızca koordinatör aşamasında
+  document.getElementById('dmusig2TxCard').style.display =
+    s.state === 'READY_FOR_TX' ? '' : 'none';
 
   // İmzalanmış TX kartı
   const signedCard = document.getElementById('dmusig2SignedCard');
@@ -1009,6 +1046,7 @@ async function dRegisterPubkey() {
     const pkHex = MuSig2D.derivePublicKey(skHex);
     const updated = await post(`/api/musig2d/${s.id}/register`,
       { participant_index: idx, pubkey_hex: pkHex });
+    localStorage.setItem(D_IDX_KEY(s.id), String(idx));
     state.dmusig2Session = updated;
     dRenderSession(updated);
     toast(`Katılımcı ${idx+1} pubkey kaydedildi`, 'success');
@@ -1029,8 +1067,9 @@ async function dBuildTx() {
   if (!amount_sat || amount_sat < 546) { toast('Geçerli miktar girin (min 546 sat)', 'error'); return; }
 
   try {
+    const description = document.getElementById('dmusig2TxDesc').value.trim();
     const updated = await post(`/api/musig2d/${s.id}/build-tx`,
-      { to_address, amount_sat, fee_sat });
+      { to_address, amount_sat, fee_sat, description });
     state.dmusig2Session = updated;
     dRenderSession(updated);
     toast(`Sighash hesaplandı — ${updated.sighashes?.length || 0} input`, 'success');
@@ -1169,10 +1208,14 @@ async function dRefreshBalance() {
   if (!s?.agg_address) return;
   try {
     const b = await get(`/api/wallet/${s.agg_address}/balance`);
-    document.getElementById('dmusig2Balance').textContent =
-      `${b.confirmed_sat.toLocaleString()} sat onaylı`;
+    const balText = `${b.confirmed_sat.toLocaleString()} sat onaylı`;
+    document.getElementById('dmusig2Balance').textContent = balText;
+    const detailsBalEl = document.getElementById('dmusig2DetailsBalance');
+    if (detailsBalEl) detailsBalEl.textContent = balText;
   } catch(e) {
     document.getElementById('dmusig2Balance').textContent = 'Bakiye alınamadı';
+    const detailsBalEl = document.getElementById('dmusig2DetailsBalance');
+    if (detailsBalEl) detailsBalEl.textContent = 'Bakiye alınamadı';
   }
 }
 

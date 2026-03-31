@@ -206,6 +206,7 @@ class DMusig2BuildTx(BaseModel):
     to_address: str
     amount_sat: int
     fee_sat: int = 500
+    description: str = ""
 
 class DMusig2SubmitNonce(BaseModel):
     participant_index: int
@@ -1289,6 +1290,7 @@ def create_dmusig2_session(req: DMusig2Create):
         "amount_sat": None,
         "fee_sat": None,
         "change_sat": 0,
+        "description": "",
         "tx_hex": None,
         "final_sig": None,
     }
@@ -1414,6 +1416,7 @@ def dmusig2_build_tx(sid: str, req: DMusig2BuildTx):
     s["amount_sat"] = req.amount_sat
     s["fee_sat"] = req.fee_sat
     s["change_sat"] = change_sat if change_sat > 546 else 0
+    s["description"] = req.description
 
     # Nonce/sig listelerini sıfırla (birden fazla build-tx çağrısına karşı)
     n_inputs = len(sighashes)
