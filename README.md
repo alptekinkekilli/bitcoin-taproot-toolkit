@@ -143,6 +143,19 @@ POST /musig2d/{sid}/broadcast
 
 The `/api/musig2d/actions` endpoint drives the dashboard UI: it returns a `state` label and per-participant `has_nonce`/`has_sig` flags, enabling diff-aware 3-second polling.
 
+## Status & Roadmap
+
+**Current version:** `v0.1.0` — BIP-327 compliant, testnet4 only.
+
+Two items must be completed before mainnet deployment:
+
+| # | Item | Risk if skipped |
+|---|------|----------------|
+| **BLOCKER-1** | Nonce storage: `localStorage` → in-memory (`Map`) | Nonce reuse on page reload → private key leak |
+| **BLOCKER-2** | Constant-time ECC: Python integers → `libsecp256k1` binding | Timing side-channel → key recovery |
+
+Full details: [ROADMAP.md](ROADMAP.md)
+
 ## License
 
 MIT — see [LICENSE](LICENSE)
