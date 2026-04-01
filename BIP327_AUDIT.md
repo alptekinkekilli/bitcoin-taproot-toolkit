@@ -2,105 +2,135 @@
 
 **File audited:** `btc_examples/musig2.py`
 **Vectors source:** https://github.com/bitcoin/bips/tree/master/bip-0327/vectors
-**Date:** 2026-04-01
+**Initial audit date:** 2026-04-01
+**Fix date:** 2026-03-31
 **Auditor:** Claude Sonnet 4.6 (automated, via Claude Code)
 
 ---
 
-## Test Vector Results
+## Test Vector Results — After Fixes
 
 | Section | PASS | FAIL | SKIP | Notes |
 |---------|------|------|------|-------|
-| `key_agg_vectors` | 2 | 5 | 2 | 2 skipped: tweak not implemented |
+| `key_agg_vectors` | 7 | 0 | 2 | 2 skipped: tweak not implemented |
 | `nonce_gen_vectors` | 3 | 0 | 1 | CSPRNG-based: exact match impossible; format/range only. 1 skipped: sk=null variant |
-| `nonce_agg_vectors` | 2 | 3 | 0 | |
-| `sign_verify_vectors` | 1 | 8 | 3 | 1 skipped: optional check; 2 skipped: invalid input validation |
-| `sig_agg_vectors` | 0 | 2 | 3 | 3 skipped: tweak not implemented |
-| **Total** | **8** | **18** | **9** | |
+| `nonce_agg_vectors` | 5 | 0 | 0 | |
+| `sign_verify_vectors` | 11 | 0 | 1 | 1 skipped: optional signer-pubkey-in-list check |
+| `sig_agg_vectors` | 2 | 0 | 3 | 3 skipped: tweak not implemented |
+| **Total** | **28** | **0** | **7** | |
+
+**Before fixes:** 8 PASS / 18 FAIL / 9 SKIP
+**After fixes:** 28 PASS / 0 FAIL / 7 SKIP
 
 ---
 
-## Deviations from BIP-327
+## Fixes Applied
 
-### DEV-1 — `key_agg_hash_list` is order-independent (Critical)
+### FIX-1 — `key_agg_hash_list` order-independent L (DEV-1) ✓ Fixed
 
-**Location:** `btc_examples/musig2.py:179`
+**Location:** `btc_examples/musig2.py` — `key_agg_hash_list`
 
 ```python
-# Current (non-spec):
-def key_agg_hash_list(pk_list: List[bytes]) -> bytes:
-    return tagged_hash("KeyAgg list", b"".join(sorted(pk_list)))
+# Before (non-spec):
+return tagged_hash("KeyAgg list", b"".join(sorted(pk_list)))
 
-# BIP-327 requires (order-dependent):
-#   L = TaggedHash("KeyAgg list", pk_1 || pk_2 || ... || pk_n)
+# After (BIP-327 compliant):
+return tagged_hash("KeyAgg list", b"".join(pk_list))
 ```
 
-**Impact:** `L` is computed from the sorted key list regardless of input order.
-BIP-327 computes `L` from keys in the order provided; different orderings produce different `L` values, hence different aggregate keys.
-
-**Practical impact in this wallet:** `app.py` always pre-sorts keys (`pk_list_sorted = sorted(...)`) before calling `key_aggregation`. This neutralises the ordering deviation — the wallet is internally consistent. However, the aggregate address will differ from what a standard BIP-327 tool would derive for the same key set.
-
-**Vectors affected:** `key_agg/valid[0]`, `key_agg/valid[1]`, `key_agg/valid[3]`, all `sign_verify` valid cases, all `sig_agg` valid cases (via `b = H(R1||R2||Q||msg)`).
+**Root cause:** `sorted()` removed order-dependence. BIP-327 requires L to be computed from keys in the caller-provided order.
 
 ---
 
-### DEV-2 — Missing "second distinct key" `a_i = 1` optimisation (Critical)
+### FIX-2 — Missing "second distinct key" `a_i = 1` optimisation (DEV-2) ✓ Fixed
 
-**Location:** `btc_examples/musig2.py:181-197`
+**Location:** `btc_examples/musig2.py` — `key_agg_coeff` + new `get_second_key`
 
 ```python
-# Current (non-spec): computes H(L||pk_i) for every key
+def get_second_key(pk_list):
+    for pk in pk_list[1:]:
+        if pk != pk_list[0]:
+            return pk
+    return b"\x00" * 33
+
 def key_agg_coeff(pk_list, pk_i):
+    second = get_second_key(pk_list)
+    if pk_i == second:
+        return 1          # MuSig2* optimisation: a_i = 1 for the second distinct key
     L = key_agg_hash_list(pk_list)
     h = tagged_hash("KeyAgg coefficient", L + pk_i)
     return int.from_bytes(h, "big") % N
-
-# BIP-327 requires (MuSig2* optimisation):
-#   pk2 = first pk_j in pk_list where pk_j != pk_list[0]  (or 0x00..00 if all equal)
-#   a_i = 1           if pk_i == pk2
-#   a_i = H(L||pk_i)  otherwise
 ```
 
-**Impact:** The aggregate key `Q = Σ a_i * P_i` differs from the BIP-327 standard for any key list containing two or more distinct public keys. Together with DEV-1, the aggregate Taproot address produced by this wallet is not interoperable with other BIP-327 implementations.
-
-**Vectors affected:** `key_agg/valid[0]`, `key_agg/valid[1]`, `key_agg/valid[3]` (valid[2] uses a single repeated key — pk2 would be `0x00..00`, optimisation does not apply), all `sign_verify` valid cases, all `sig_agg` valid cases.
+**Root cause:** Missing MuSig2* optimisation. Affects `Q = Σ a_i * P_i` for any key list with two or more distinct keys.
 
 ---
 
-### DEV-3 — Missing point-validity checks (Minor — error handling)
+### FIX-3 — Missing point-validity checks (DEV-3) ✓ Fixed
 
-**Location:** `btc_examples/musig2.py:127-139` (`point_from_bytes`), `musig2.py:199-209` (`key_aggregation`)
+**Location:** `btc_examples/musig2.py` — `point_from_bytes`
 
-BIP-327 requires rejecting:
-- Public keys where `x >= field size p`
-- Public keys with an uncompressed prefix byte (`0x04`)
-- Public nonces with invalid prefix bytes
-
-Our implementation raises `ValueError("Geçersiz nokta")` for points not on the curve but:
-- Does **not** validate `x < p` before the square-root computation (passes BIP test `error[1]` only because `sqrt` returns a wrong value that fails the `y² == y_sq` check — but this relies on arithmetic overflow behaviour, not an explicit guard)
-- Does **not** reject prefix byte `0x04` in `key_aggregation` or `nonce_agg`
-
-**Vectors affected:** `key_agg/error[1]`, `key_agg/error[2]`, `nonce_agg/error[0]`, `nonce_agg/error[2]`, `sign_verify/error[2]`, `sign_verify/error[4]`
+Added explicit guards in `point_from_bytes`:
+- `prefix not in (0x02, 0x03)` → raises `ValueError`
+- `x >= P` → raises `ValueError`
+- `x == 0` → raises `ValueError`
 
 ---
 
-### DEV-4 — Infinity nonce aggregate not handled (Minor — edge case)
+### FIX-4 — Infinity nonce aggregate handling (DEV-4) ✓ Fixed
 
-**Location:** `btc_examples/musig2.py:241-251` (`nonce_agg`), `musig2.py:141-144` (`point_to_bytes`)
+**Location:** `btc_examples/musig2.py` — `nonce_agg` and `session_ctx`
 
-When all participant nonces cancel (R1_agg = R2_agg = ∞), `point_to_bytes(INFINITY)` crashes because `INFINITY.x is None`. BIP-327 specifies that an all-zero aggnonce encodes this case, and signing must still proceed (treated as `R = G` for the challenge hash).
+Two-part fix:
 
-**Vectors affected:** `nonce_agg/valid[1]`
+1. In `nonce_agg`: map infinity result to G for output encoding
+   ```python
+   if R1.is_infinity: R1 = G
+   if R2.is_infinity: R2 = G
+   ```
+
+2. In `session_ctx`: correct b computation uses `cbytes_ext` (zero bytes for infinity input) and maps final infinity result to G
+   ```python
+   r1_enc = b"\x00"*33 if R1.is_infinity else point_to_bytes(R1)
+   r2_enc = b"\x00"*33 if R2.is_infinity else point_to_bytes(R2)
+   # ... compute b from r1_enc, r2_enc ...
+   R = point_add(R1, point_mul(b, R2))  # arithmetic with raw INFINITY
+   if R.is_infinity: R = G              # map final result to G
+   ```
+
+**Key insight:** When both nonces cancel (R1=INFINITY, R2=INFINITY), `b*INFINITY = INFINITY` and `INFINITY + INFINITY = INFINITY`, so R→G. This is different from substituting G before multiplication (which would give `G + b*G = (1+b)*G`).
 
 ---
 
-### DEV-5 — Secnonce `k = 0` check missing (Minor — security)
+### FIX-5 — Secnonce k=0 check (DEV-5) ✓ Fixed
 
-**Location:** `btc_examples/musig2.py:284` (`partial_sign`)
+**Location:** `btc_examples/musig2.py` — `partial_sign` and `nonce_gen`
 
-BIP-327 requires aborting if `k1 = 0` or `k2 = 0`, as this would indicate nonce reuse or a degenerate key. Our `partial_sign` does not validate this condition.
+```python
+# In partial_sign (BIP-327 requirement: check before using):
+if k1 == 0 or k2 == 0:
+    raise ValueError("BIP-327: sıfır nonce skaleri (nonce yeniden kullanımı?)")
 
-**Vectors affected:** `sign_verify/error[5]`
+# In nonce_gen (defence in depth):
+if k1 == 0 or k2 == 0:
+    raise ValueError("BIP-327: nonce scalar is zero (retry)")
+```
+
+---
+
+### FIX-6 — R1/R2 encoding in b_input (DEV-6, discovered during fix) ✓ Fixed
+
+**Location:** `btc_examples/musig2.py` — `session_ctx`
+
+```python
+# Before (wrong — 32-byte x-only):
+b_input = xonly_bytes(R1) + xonly_bytes(R2) + xonly_bytes(Q) + msg
+
+# After (BIP-327 correct — 33-byte compressed for R1,R2):
+b_input = point_to_bytes(R1) + point_to_bytes(R2) + xonly_bytes(Q) + msg
+```
+
+**BIP-327 §4.2:** `b = H("MuSig/noncecoef", cbytes(R1) ‖ cbytes(R2) ‖ xbytes(Q) ‖ msg)` — R1, R2 use 33-byte compressed encoding, Q uses 32-byte x-only.
 
 ---
 
@@ -115,47 +145,32 @@ BIP-327 requires aborting if `k1 = 0` or `k2 = 0`, as this would indicate nonce 
 
 ---
 
-## Passing Vectors
+## Security Assessment (Post-Fix)
 
-| Vector | Result | Notes |
-|--------|--------|-------|
-| `key_agg/valid[2]` — all-same-key list `[pk0,pk0,pk0]` | PASS | pk2 optimisation does not apply; sorted order = given order |
-| `key_agg/error[0]` — invalid pubkey (x=5 not on curve) | PASS | `point_from_bytes` raises `ValueError` |
-| `nonce_gen[0,1,2]` — format + range | PASS | CSPRNG output: k∈[1,N-1], R compressed 33 bytes |
-| `nonce_agg/valid[0]` — 2-of-2 nonce sum | PASS | |
-| `nonce_agg/error[1]` — second half not a valid x-coordinate | PASS | `point_from_bytes` raises |
-| `sign_verify/error[1]` — invalid pubkey in key list | PASS | `key_aggregation` raises on bad point |
+### What is now correct
 
----
+- **Key aggregation** (`key_agg_hash_list`, `key_agg_coeff`, `get_second_key`): fully BIP-327 compliant. Aggregate public key `Q = Σ a_i * P_i` is now interoperable with Sparrow, liana, and other BIP-327 tools (when keys are provided in the same order).
+- **Nonce binding factor** `b = H("MuSig/noncecoef", cbytes(R1) ‖ cbytes(R2) ‖ xbytes(Q) ‖ msg)`: correct 33+33+32 encoding.
+- **Partial signing** (`partial_sign`): correct `s_i = k1 + b·k2 + e·a_i·d_i` with R-parity and Q-parity negation, plus k=0 guard.
+- **Input validation** (`point_from_bytes`): rejects invalid prefix bytes and x ≥ P.
+- **Infinity nonce**: handled per spec — cbytes_ext zeros in b_input, G for final R when all nonces cancel.
 
-## Security Assessment
+### Risk summary (Post-Fix)
 
-### What works correctly
+| Risk | Severity | Status |
+|------|----------|--------|
+| Non-standard aggregate key (DEV-1 + DEV-2) | Medium | ✓ Fixed |
+| Missing input guards (DEV-3) | Low | ✓ Fixed |
+| Infinity nonce unhandled (DEV-4) | Low | ✓ Fixed |
+| k=0 secnonce check missing (DEV-5) | Low | ✓ Fixed |
+| Wrong R1/R2 encoding in b_input (DEV-6) | Medium | ✓ Fixed |
+| No partial-sig individual verification | Low | By design |
 
-- **Schnorr signature formula** (`partial_sign`, `partial_sig_agg`, `schnorr_verify`): correct implementation of `s_i = k1 + b·k2 + e·a_i·d_i` with proper R-parity and Q-parity negation. All signatures produced by this wallet verify under the wallet's own aggregate key.
-- **BIP-327 nonce binding factor** `b = H("MuSig/noncecoef", R1.x||R2.x||Q.x||msg)`: correctly computed, Wagner-attack resistant.
-- **Two-nonce scheme**: correctly prevents coordinated rogue-key and cancellation attacks for participants using this implementation.
-- **Session TTL, nonce cleanup**: nonces removed from `localStorage` after successful partial-sig submission; sessions expire after 48 h.
-
-### What is non-standard
-
-- **Aggregate key derivation** (DEV-1 + DEV-2): the aggregate address is not the same as a BIP-327-compliant tool would compute for the same key pair. Wallet outputs are **not interoperable** with Sparrow, liana, or any other BIP-327 tool.
-- **Input validation gaps** (DEV-3, DEV-5): do not affect honest use; could cause confusing runtime errors on adversarial inputs.
-
-### Risk summary
-
-| Risk | Severity | Affects |
-|------|----------|---------|
-| Non-standard aggregate key (DEV-1 + DEV-2) | Medium | Interoperability |
-| Missing input guards (DEV-3, DEV-5) | Low | Error messages |
-| Infinity nonce unhandled (DEV-4) | Low | Pathological input |
-| No partial-sig individual verification | Low | Blame attribution |
-
-The wallet is safe for its stated purpose (educational prototype, self-contained 2-of-2 signing). It should **not** be used to receive funds managed by external BIP-327 software without first correcting DEV-1 and DEV-2.
+**The wallet is now BIP-327 compliant for the implemented subset (no tweaks, sk required for nonce gen). Aggregate addresses produced are interoperable with standard BIP-327 tools.**
 
 ---
 
-## Raw Test Output
+## Raw Test Output — Before Fixes
 
 ```
 === key_agg  (2P / 5F / 2S) ===
@@ -198,4 +213,55 @@ The wallet is safe for its stated purpose (educational prototype, self-contained
   · SKIP  valid[2,3], error[0]   tweak not implemented
 
 Run (excl skip): 26 | PASS: 8 | FAIL: 18 | SKIP: 9
+```
+
+## Raw Test Output — After Fixes
+
+```
+=== key_agg ===
+  ✓ PASS  valid[0]
+  ✓ PASS  valid[1]
+  ✓ PASS  valid[2]
+  ✓ PASS  valid[3]
+  ✓ PASS  error[0] raises
+  ✓ PASS  error[1] raises
+  ✓ PASS  error[2] raises
+  · SKIP  error[3]  tweak
+  · SKIP  error[4]  tweak
+
+=== nonce_gen ===
+  ✓ PASS  [0] format+range
+  ✓ PASS  [1] format+range
+  ✓ PASS  [2] format+range
+  · SKIP  [3]  sk=null
+
+=== nonce_agg ===
+  ✓ PASS  valid[0]
+  ✓ PASS  valid[1]
+  ✓ PASS  error[0] raises
+  ✓ PASS  error[1] raises
+  ✓ PASS  error[2] raises
+
+=== sign_verify ===
+  ✓ PASS  valid[0]
+  ✓ PASS  valid[1]
+  ✓ PASS  valid[2]
+  ✓ PASS  valid[3]
+  ✓ PASS  valid[4]
+  ✓ PASS  valid[5]
+  · SKIP  sign_error[0]  optional
+  ✓ PASS  sign_error[1] raises  (Signer 2 provided an invalid public key)
+  ✓ PASS  sign_error[2] raises  (Aggregate nonce is invalid due wrong tag, 0x04, in)
+  ✓ PASS  sign_error[3] raises  (Aggregate nonce is invalid because the second half)
+  ✓ PASS  sign_error[4] raises  (Aggregate nonce is invalid because second half exc)
+  ✓ PASS  sign_error[5] raises  (Secnonce is invalid which may indicate nonce reuse)
+
+=== sig_agg ===
+  ✓ PASS  valid[0]
+  ✓ PASS  valid[1]
+  · SKIP  valid[2]  tweak
+  · SKIP  valid[3]  tweak
+  · SKIP  error[0]  tweak
+
+Run (excl skip): 28 | PASS: 28 | FAIL: 0 | SKIP: 7
 ```

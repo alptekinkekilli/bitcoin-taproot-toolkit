@@ -129,11 +129,17 @@ def point_from_bytes(b: bytes) -> Point:
     if len(b) != 33:
         raise ValueError("33 bayt gerekli")
     prefix = b[0]
+    if prefix not in (0x02, 0x03):
+        raise ValueError(f"Geçersiz prefix: {prefix:#04x} (0x02 veya 0x03 beklendi)")
     x = int.from_bytes(b[1:], "big")
+    if x >= P:
+        raise ValueError("x koordinatı field prime'dan büyük veya eşit")
+    if x == 0:
+        raise ValueError("x koordinatı sıfır")
     y_sq = (pow(x, 3, P) + 7) % P
     y = pow(y_sq, (P + 1) // 4, P)
     if pow(y, 2, P) != y_sq:
-        raise ValueError("Geçersiz nokta")
+        raise ValueError("Geçersiz nokta: x eğri üzerinde değil")
     if (y % 2) != (prefix - 2):
         y = P - y
     return Point(x, y)
@@ -170,28 +176,47 @@ def key_agg_hash_list(pk_list: List[bytes]) -> bytes:
     """
     BIP-327 §Key Aggregation — L değerini hesapla.
 
-    L = TaggedHash("KeyAgg list", sort(pk1) ‖ sort(pk2) ‖ ...)
+    L = TaggedHash("KeyAgg list", pk1 ‖ pk2 ‖ ...)
 
-    Sıralama (lexicografik) zorunludur; aksi takdirde her
-    katılımcı farklı L → farklı Q hesaplar ve protokol çöker.
-    pk_list'in çağıran tarafından sıralanmış olması beklenir.
+    Girdi sırası L'yi belirler; çağıran taraf sıralamayı
+    kendi yapar (BIP-327: lexicografik sıra standart).
     """
-    return tagged_hash("KeyAgg list", b"".join(sorted(pk_list)))
+    return tagged_hash("KeyAgg list", b"".join(pk_list))
+
+def get_second_key(pk_list: List[bytes]) -> bytes:
+    """
+    BIP-327 §Key Aggregation — listede ilk anahtardan farklı
+    olan ilk anahtarı döndür (pk2).
+
+    Tüm anahtarlar aynıysa 33 bayt sıfır döner (optimizasyon
+    uygulanmaz; hepsi H(L||pk_i) katsayısına sahip olur).
+    """
+    for pk in pk_list[1:]:
+        if pk != pk_list[0]:
+            return pk
+    return b"\x00" * 33
+
 
 def key_agg_coeff(pk_list: List[bytes], pk_i: bytes) -> int:
     """
     BIP-327 §Key Aggregation — katılımcı katsayısı (a_i).
 
-    a_i = TaggedHash("KeyAgg coefficient", L ‖ pk_i)  mod N
+    MuSig2* optimizasyonu (BIP-327 §4.1):
+        pk2 = listede ilk anahtardan farklı olan ilk anahtar
+        a_i = 1                               eğer pk_i == pk2
+        a_i = H("KeyAgg coefficient", L‖pk_i) diğer durumlarda
 
-    Katsayılar iki amaca hizmet eder:
-      1. Rogue-key saldırısını önler (rastgele lineer kombinasyon)
-      2. Her katılımcının katkısını birbirinden bağımsız kılar
+    Bu optimizasyon bir anahtarın imzalama yükünü azaltır;
+    rogue-key güvenliğini korur çünkü en az bir anahtar
+    (pk_list[0]) her zaman hash katsayısı alır.
 
     Argümanlar:
-        pk_list : Sıralanmış tam katılımcı listesi
+        pk_list : Tam katılımcı listesi (BIP-327 sırasıyla)
         pk_i    : Katsayısı hesaplanacak katılımcının açık anahtarı
     """
+    second = get_second_key(pk_list)
+    if pk_i == second:
+        return 1
     L = key_agg_hash_list(pk_list)
     h = tagged_hash("KeyAgg coefficient", L + pk_i)
     return int.from_bytes(h, "big") % N
@@ -234,6 +259,9 @@ def nonce_gen(sk: bytes, pk: bytes, msg: bytes) -> Tuple[Tuple[int, int], Tuple[
     rand = secrets.token_bytes(32)
     k1 = int.from_bytes(tagged_hash("MuSig/nonce", rand + sk + pk + msg + b"\x00"), "big") % N
     k2 = int.from_bytes(tagged_hash("MuSig/nonce", rand + sk + pk + msg + b"\x01"), "big") % N
+    # BIP-327: k=0 dejenere durumu; pratikte imkânsız ama spec gereği kontrol edilmeli
+    if k1 == 0 or k2 == 0:
+        raise ValueError("BIP-327: nonce scalar is zero (retry)")
     R1 = point_to_bytes(point_mul(k1, G))
     R2 = point_to_bytes(point_mul(k2, G))
     return (k1, k2), (R1, R2)
@@ -248,6 +276,11 @@ def nonce_agg(pub_nonces: List[Tuple[bytes, bytes]]) -> Tuple[Point, Point]:
     for (r1_bytes, r2_bytes) in pub_nonces:
         R1 = point_add(R1, point_from_bytes(r1_bytes))
         R2 = point_add(R2, point_from_bytes(r2_bytes))
+    # BIP-327: tüm nonce'lar iptal olursa sonsuz noktayı G ile değiştir
+    if R1.is_infinity:
+        R1 = G
+    if R2.is_infinity:
+        R2 = G
     return R1, R2
 
 def session_ctx(agg_nonce: Tuple[Point, Point], Q: Point, msg: bytes) -> Tuple[Point, int]:
@@ -272,10 +305,16 @@ def session_ctx(agg_nonce: Tuple[Point, Point], Q: Point, msg: bytes) -> Tuple[P
         (R, b) — R: nihai nonce noktası, b: bağlama katsayısı
     """
     R1, R2 = agg_nonce
-    b_input = (xonly_bytes(R1) + xonly_bytes(R2) +
-               xonly_bytes(Q) + msg)
+    # BIP-327: cbytes_ext — sonsuz nokta için 33 sıfır bayt, aksi hâlde 33 bayt compressed
+    r1_enc = b"\x00" * 33 if R1.is_infinity else point_to_bytes(R1)
+    r2_enc = b"\x00" * 33 if R2.is_infinity else point_to_bytes(R2)
+    b_input = r1_enc + r2_enc + xonly_bytes(Q) + msg
     b = int.from_bytes(tagged_hash("MuSig/noncecoef", b_input), "big") % N
+    # Toplam nonce R = R1 + b·R2 hesapla; sonsuz ise G kullan (BIP-327 §Sign)
+    # Not: point_mul(b, INFINITY) = INFINITY, point_add(INFINITY, INFINITY) = INFINITY
     R = point_add(R1, point_mul(b, R2))
+    if R.is_infinity:
+        R = G
     if not has_even_y(R):
         # R'yi normalize et: k → N - k
         return R, b
@@ -318,6 +357,9 @@ def partial_sign(
         s_i (int) — kısmi imza skaleri; diğer katılımcılara iletilir
     """
     k1, k2 = secret_nonce
+    # BIP-327: k=0 dejenere nonce'u reddet (nonce yeniden kullanımı belirtisi)
+    if k1 == 0 or k2 == 0:
+        raise ValueError("BIP-327: sıfır nonce skaleri (nonce yeniden kullanımı?)")
     R, b = session_ctx(agg_nonce, Q, msg)
 
     # İmza hash'i (BIP340)
