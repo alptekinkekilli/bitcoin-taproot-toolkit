@@ -1140,6 +1140,7 @@ async function dJoinSession() {
 
 async function dOpenSession(sid) {
   try {
+    showTab('musig2d');
     const s = await get(`/api/musig2d/${sid}`);
     state.dmusig2Session = s;
 
