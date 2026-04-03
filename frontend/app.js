@@ -21,6 +21,7 @@ let state = {
   archivePage: 1,
   archivePageSize: 25,
   _archiveOpenedDetail: false,
+  dmusig2SubTab: 'active',
 };
 
 // ── Init ──────────────────────────────────────────────────────────────────────
@@ -70,14 +71,9 @@ function showTab(name) {
     if (newBtn)  newBtn.style.display  = '';
     if (joinBtn) joinBtn.style.display = '';
 
-    // Sub-tab görünürlüğünü koru — arşiv açıksa listeye dokunma
-    const archive = document.getElementById('dmusig2Archive');
-    const list    = document.getElementById('dmusig2SessionList');
-    if (archive && archive.style.display !== 'none') {
-      // Arşiv sekmesi aktif — listeye dokunma
-    } else {
-      if (list) list.style.display = '';
-    }
+    // Dışarıdan bu sekmeye dönüldüğünde Aktif tab'ı varsayılan yap
+    state.dmusig2SubTab = 'active';
+    dShowSubTab('active');
 
     dLoadSessionList();
     // Phase 3: pubkey biliniyorsa polling'i başlat ve hemen bir tick çalıştır
@@ -987,6 +983,9 @@ function dRenderDashboard(actions) {
   const dash = document.getElementById('dmusig2Dashboard');
   if (!dash) return;
 
+  // Arşiv sekmesi aktifken dashboard'u gösterme — polling bunu ezmemeli
+  if (state.dmusig2SubTab !== 'active') return;
+
   // Dashboard yalnızca pubkey biliniyorsa anlamlı
   if (!state.myPubkey || !actions || !actions.length) {
     dash.style.display = 'none';
@@ -994,16 +993,15 @@ function dRenderDashboard(actions) {
   }
   dash.style.display = '';
 
-  const ACTIVE   = new Set(['build_tx','submit_nonce','submit_partial_sig','broadcast']);
-  const WAITING  = new Set(['wait_pubkeys','wait_coordinator','wait_nonce','wait_sig']);
+  const ACTIVE  = new Set(['build_tx','submit_nonce','submit_partial_sig','broadcast']);
+  const WAITING = new Set(['wait_pubkeys','wait_coordinator','wait_nonce','wait_sig']);
 
-  const pending   = actions.filter(a => ACTIVE.has(a.action));
-  const watching  = actions.filter(a => WAITING.has(a.action));
-  const completed = actions.filter(a => a.action === 'done');
+  // BROADCAST (done) session'lar arşive ait — aktif tab'da gösterme
+  const pending  = actions.filter(a => ACTIVE.has(a.action));
+  const watching = actions.filter(a => WAITING.has(a.action));
 
-  const pendingEl   = document.getElementById('dmusig2DashPending');
-  const watchingEl  = document.getElementById('dmusig2DashWatching');
-  const completedEl = document.getElementById('dmusig2DashCompleted');
+  const pendingEl  = document.getElementById('dmusig2DashPending');
+  const watchingEl = document.getElementById('dmusig2DashWatching');
 
   pendingEl.innerHTML = pending.length
     ? pending.map(_dDashCard).join('')
@@ -1012,10 +1010,6 @@ function dRenderDashboard(actions) {
   watchingEl.innerHTML = watching.length
     ? watching.map(_dDashCard).join('')
     : '<div class="empty-state" style="padding:10px 16px;font-size:0.85em">İzlenen oturum yok.</div>';
-
-  completedEl.innerHTML = completed.length
-    ? completed.map(_dDashCard).join('')
-    : '<div class="empty-state" style="padding:10px 16px;font-size:0.85em">Tamamlanan oturum yok.</div>';
 }
 
 // Tek polling ticki — _dPolling flag ile race condition engellenir
@@ -1101,6 +1095,8 @@ function dStateBadge(s) {
 
 function dShowSubTab(tab) {
   const isActive = tab === 'active';
+  state.dmusig2SubTab = tab;
+
   const dashboard = document.getElementById('dmusig2Dashboard');
   const list      = document.getElementById('dmusig2SessionList');
   const archive   = document.getElementById('dmusig2Archive');
@@ -1122,7 +1118,8 @@ function dShowSubTab(tab) {
     btnB.style.color             = !isActive ? 'var(--orange)' : 'var(--text-2)';
   }
 
-  if (!isActive && !state.archiveSessions.length) {
+  if (!isActive) {
+    // Arşiv'e geçildiğinde her zaman taze veri yükle
     dArchiveLoad();
   }
 }
@@ -1460,7 +1457,16 @@ async function dLoadSessionList() {
   try {
     const sessions = await get('/api/musig2d/list');
     const el = document.getElementById('dmusig2SessionList');
-    if (!sessions.length) {
+
+    // Arşiv badge'ini güncelle
+    const archived = sessions.filter(s => s.state === 'BROADCAST' || s.state === 'SIGNED');
+    const badge = document.getElementById('dArchiveBadge');
+    if (badge) badge.textContent = archived.length ? String(archived.length) : '';
+
+    // Aktif listede yalnızca tamamlanmamış session'lar
+    const active = sessions.filter(s => s.state !== 'BROADCAST' && s.state !== 'SIGNED');
+
+    if (!active.length) {
       el.innerHTML = '<div class="empty-state">Henüz dağıtık MuSig2 oturumu yok.<br>Yeni bir oturum oluşturun.</div>';
       return;
     }
@@ -1469,7 +1475,7 @@ async function dLoadSessionList() {
         <table class="data-table">
           <thead><tr><th>ID</th><th>Etiket</th><th>N</th><th>Ağ</th><th>Durum</th><th></th></tr></thead>
           <tbody>
-            ${sessions.map(s => `
+            ${active.map(s => `
               <tr>
                 <td><code style="font-size:0.82em;color:#58a6ff">${s.id}</code></td>
                 <td>${s.label}</td>
@@ -1484,11 +1490,6 @@ async function dLoadSessionList() {
           </tbody>
         </table>
       </div>`;
-
-    // 4L: Arşiv badge'ini güncelle
-    const archived = sessions.filter(s => s.state === 'BROADCAST' || s.state === 'SIGNED');
-    const badge = document.getElementById('dArchiveBadge');
-    if (badge) badge.textContent = archived.length ? String(archived.length) : '';
   } catch(e) {
     uiLog(`Dağıtık MuSig2 listesi yüklenemedi: ${e.message}`, 'ERR');
   }
