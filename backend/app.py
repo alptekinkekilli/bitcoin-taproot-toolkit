@@ -226,6 +226,7 @@ class DMusig2Create(BaseModel):
     label: str
     n_participants: int
     network: str = "testnet4"
+    source_session_id: Optional[str] = None
 
 class DMusig2Register(BaseModel):
     participant_index: int
@@ -1324,6 +1325,8 @@ def create_dmusig2_session(req: DMusig2Create):
         "tx_hex": None,
         "final_sig": None,
         "created_at": int(_time.time()),   # Phase 5: TTL hesabı için
+        "txid": None,
+        "source_session_id": req.source_session_id,
     }
     _save_dmusig2()
     return dmusig2_sessions[sid]
@@ -1331,7 +1334,9 @@ def create_dmusig2_session(req: DMusig2Create):
 
 @app.get("/api/musig2d/list")
 def list_dmusig2():
-    return list(dmusig2_sessions.values())
+    def _norm(s):
+        return {**s, "txid": s.get("txid"), "created_at": s.get("created_at"), "source_session_id": s.get("source_session_id")}
+    return [_norm(s) for s in dmusig2_sessions.values()]
 
 
 @app.get("/api/musig2d/actions")
@@ -1443,7 +1448,7 @@ def get_dmusig2_session(sid: str):
     # Backfill agg_q_even_y for sessions loaded from disk before this field existed
     if _migrate_dmusig2_session(s):
         _save_dmusig2()
-    return s
+    return {**s, "txid": s.get("txid"), "created_at": s.get("created_at"), "source_session_id": s.get("source_session_id")}
 
 
 @app.delete("/api/musig2d/{sid}")
@@ -1687,18 +1692,17 @@ def dmusig2_submit_sig(sid: str, req: DMusig2SubmitSig):
             ]
 
             q_even_actual = (Q.y % 2 == 0)
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("[submit-partial-sig] Input %d sighash=%s agg_xonly=%s "
-                             "Q_even_y=%s(stored=%s) R.x=%s R_even_y=%s b=%s",
-                             i, sighash.hex(), s['agg_xonly'],
-                             q_even_actual, s.get('agg_q_even_y'),
-                             R.x.to_bytes(32,'big').hex(), R.y % 2 == 0, hex(b))
-                for pi, p in enumerate(s["participants"]):
-                    logger.debug("  partial_sig[%d]=%s pubkey[%d]=%s",
-                                 pi, p['partial_sigs'][i], pi, p.get('pubkey','?'))
+            # DEBUG INFO — daima log (geçici, karşılaştırma için)
+            logger.info("[SIGN-DEBUG] Input %d | Q_even_y=%s(stored=%s) | R.x=%s | R_even=%s | b=%s",
+                        i, q_even_actual, s.get('agg_q_even_y'),
+                        R.x.to_bytes(32,'big').hex(), R.y % 2 == 0, hex(b)[2:])
+            for pi, p in enumerate(s["participants"]):
+                logger.info("  [SIGN-DEBUG] partial_sig[%d]=%s | pubkey=%s",
+                            pi, p['partial_sigs'][i], p.get('pubkey','?')[:16])
 
             final_sig = partial_sig_agg(partial_sigs_i, R)
-            logger.debug("[submit-partial-sig] final_sig=%s", final_sig.hex())
+            logger.info("[SIGN-DEBUG] final_sig=%s | verify=%s",
+                        final_sig.hex(), schnorr_verify(sighash, _xonly(Q), final_sig))
 
             if not schnorr_verify(sighash, _xonly(Q), final_sig):
                 detail = (
@@ -1734,6 +1738,7 @@ def dmusig2_broadcast(sid: str):
         with ur.urlopen(req2, timeout=15) as r:
             txid = r.read().decode()
         s["state"] = "BROADCAST"
+        s["txid"] = txid
         _save_dmusig2()
         return {"txid": txid}
     except ur.error.HTTPError as e:
@@ -1741,6 +1746,31 @@ def dmusig2_broadcast(sid: str):
         raise HTTPException(400, f"Yayınlama başarısız: {err}")
     except Exception as e:
         raise HTTPException(500, f"Bağlantı hatası: {e}")
+
+
+@app.post("/api/musig2d/{sid}/reset-nonces")
+def dmusig2_reset_nonces(sid: str):
+    """
+    Nonce ve partial sig verilerini sıfırlar, state'i COLLECTING_NONCES'a döndürür.
+    Aggregate Schnorr doğrulaması başarısız olduğunda yeniden deneme için kullanılır.
+    Sighash'ler ve TX parametreleri korunur — build-tx yeniden çalıştırılmaz.
+    """
+    s = dmusig2_sessions.get(sid)
+    if not s:
+        raise HTTPException(404, "Oturum bulunamadı")
+    if s["state"] not in ("COLLECTING_SIGS", "COLLECTING_NONCES"):
+        raise HTTPException(400, f"Sıfırlama için geçersiz durum: {s['state']}")
+
+    n_inputs = len(s["sighashes"])
+    for p in s["participants"]:
+        p["pubnonces"] = [None] * n_inputs
+        p["partial_sigs"] = [None] * n_inputs
+
+    s["agg_nonces"] = [None] * n_inputs
+    s["state"] = "COLLECTING_NONCES"
+
+    _save_dmusig2()
+    return s
 
 
 # ── Phase 6: SSE — Session Olay Akışı (Placeholder) ──────────────────────────

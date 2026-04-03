@@ -224,16 +224,27 @@ const MuSig2D = (() => {
     if (typeof pkHex !== 'string' || pkHex.length !== 66)
       throw new Error('keyAggCoeff: pkHex 33-byte compressed hex (66 karakter) gerekli');
 
-    const sorted = pkListSortedHex.map(hexToBytes).sort((a, b) => {
-      for (let i = 0; i < 33; i++) {
-        if (a[i] < b[i]) return -1;
-        if (a[i] > b[i]) return 1;
+    // BIP-327: L = H_KeyAgg_list(pk_list) — caller-provided order, no re-sort
+    const pkListBytes = pkListSortedHex.map(hexToBytes);
+    const pkIBytes    = hexToBytes(pkHex);
+
+    // MuSig2* optimisation (BIP-327 §Key Aggregation):
+    // The second distinct key in the list gets a_i = 1.
+    // Same as Python backend get_second_key() + key_agg_coeff() — DEV-2 fix.
+    const firstKey = pkListBytes[0];
+    let secondKey  = null;
+    for (let i = 1; i < pkListBytes.length; i++) {
+      if (!pkListBytes[i].every((b, j) => b === firstKey[j])) {
+        secondKey = pkListBytes[i];
+        break;
       }
-      return 0;
-    });
-    const L   = await taggedHash('KeyAgg list', concatBytes(...sorted));
-    const pkI = hexToBytes(pkHex);
-    const h   = await taggedHash('KeyAgg coefficient', concatBytes(L, pkI));
+    }
+    if (secondKey !== null && pkIBytes.every((b, j) => b === secondKey[j])) {
+      return 1n;   // MuSig2* optimisation: a_i = 1 for second distinct key
+    }
+
+    const L = await taggedHash('KeyAgg list', concatBytes(...pkListBytes));
+    const h = await taggedHash('KeyAgg coefficient', concatBytes(L, pkIBytes));
     return bytesToBigint(h) % N;
   }
 
@@ -307,9 +318,11 @@ const MuSig2D = (() => {
     const R1 = pointFromBytes(hexToBytes(aggNonce.r1));
     const R2 = pointFromBytes(hexToBytes(aggNonce.r2));
 
-    // b = H_noncecoef(R1.x ‖ R2.x ‖ Q.x ‖ msg)
+    // b = H_noncecoef(cbytes(R1) ‖ cbytes(R2) ‖ xbytes(Q) ‖ msg)  — BIP-327 §4.2
+    // R1, R2: 33-byte compressed (same as Python backend FIX-6 / DEV-6)
+    // Q: 32-byte x-only
     const bHash = await taggedHash('MuSig/noncecoef',
-      concatBytes(xonlyBytes(R1), xonlyBytes(R2), xonlyBytes(Q), msgBytes));
+      concatBytes(pointToBytes(R1), pointToBytes(R2), xonlyBytes(Q), msgBytes));
     const b = bytesToBigint(bHash) % N;
 
     const R = pointAdd(R1, pointMul(b, R2));
@@ -324,10 +337,23 @@ const MuSig2D = (() => {
     let k1eff = k1;
     let k2eff = k2;
 
-    if (!qEvenY)      d     = modn(N - d);        // BUG FIX: use actual Q parity from backend
+    if (!qEvenY)      d     = modn(N - d);
     if (!hasEvenY(R)) { k1eff = modn(N - k1); k2eff = modn(N - k2); }
 
     const si = modn(k1eff + b * k2eff + e * coeffBigint * d);
+
+    // DEBUG — karşılaştırma için backend değerleriyle eşleştir
+    console.group('[partialSign DEBUG]');
+    console.log('qEvenY          :', qEvenY);
+    console.log('R.x (hex)       :', R.x.toString(16).padStart(64,'0'));
+    console.log('R_even_y        :', hasEvenY(R));
+    console.log('b (hex)         :', b.toString(16));
+    console.log('e (hex)         :', e.toString(16));
+    console.log('coeff (hex)     :', coeffBigint === 1n ? '1 (MuSig2* opt)' : coeffBigint.toString(16));
+    console.log('d_negated       :', !qEvenY);
+    console.log('si (hex)        :', si.toString(16).padStart(64,'0'));
+    console.groupEnd();
+
     return bytesToHex(bigintToBytes(si, 32));
   }
 

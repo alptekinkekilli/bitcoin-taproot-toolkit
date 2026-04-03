@@ -7,6 +7,14 @@ __pycache__/
 venv/
 *.egg-info/
 
+# Virtualenv (local install)
+bin/
+lib/
+lib64
+share/
+include/
+pyvenv.cfg
+
 # Node
 node_modules/
 dist/

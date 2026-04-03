@@ -481,3 +481,63 @@ body {
 .bold   { font-weight: 700; }
 .link   { color: var(--blue); cursor: pointer; text-decoration: none; }
 .link:hover { text-decoration: underline; }
+
+/* ── Arşiv: Filtre chip ───────────────────── */
+.filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: var(--bg-4);
+  border: 1px solid var(--border-2);
+  border-radius: 20px;
+  padding: 2px 10px 2px 12px;
+  font-size: 11px;
+  color: var(--text-2);
+}
+
+.filter-chip-remove {
+  background: none;
+  border: none;
+  color: var(--text-3);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0;
+  transition: color .15s;
+}
+
+.filter-chip-remove:hover {
+  color: var(--red);
+}
+
+/* ── Arşiv: Tablo satırı tıklanabilir ────── */
+#dArchiveBody tr {
+  cursor: pointer;
+  transition: background .1s;
+}
+
+#dArchiveBody tr:hover {
+  background: var(--bg-3);
+}
+
+/* ── Arşiv: Sub-tab buton hover ─────────── */
+#dSubTabActive:hover,
+#dSubTabArchive:hover {
+  color: var(--text) !important;
+  background: var(--bg-3);
+}
+
+/* ── Arşiv: Mobil gizle ──────────────────── */
+@media (max-width: 640px) {
+  .d-hide-mobile {
+    display: none !important;
+  }
+
+  #dmusig2Archive > div:first-child > div:first-child {
+    flex-direction: column;
+  }
+
+  #dmusig2Archive > div:first-child > div:first-child > div {
+    min-width: 100% !important;
+  }
+}

@@ -16,6 +16,11 @@ let state = {
   myPubkey: null,         // Phase 1: oturumdaki kendi pubkey'im
   myIndex:  null,         // Phase 1: oturumdaki katılımcı indexim
   myRole:   null,         // Phase 1: 'coordinator' | 'participant' | null
+  archiveSessions: [],
+  archiveFiltered: [],
+  archivePage: 1,
+  archivePageSize: 25,
+  _archiveOpenedDetail: false,
 };
 
 // ── Init ──────────────────────────────────────────────────────────────────────
@@ -51,6 +56,29 @@ function showTab(name) {
   if (name === 'transactions') loadTxHistory();
   if (name === 'musig2') loadMusig2();
   if (name === 'musig2d') {
+    // Detay paneli açık kalmışsa temizle
+    const detail = document.getElementById('dmusig2Detail');
+    if (detail && detail.style.display !== 'none') {
+      detail.style.display = 'none';
+      state.dmusig2Session = null;
+      state._archiveOpenedDetail = false;
+    }
+
+    // Header butonlarını her zaman restore et
+    const newBtn  = document.querySelector('.page-header button[onclick="dOpenNewSessionModal()"]');
+    const joinBtn = document.querySelector('.page-header button[onclick="openModal(\'dJoinSessionModal\')"]');
+    if (newBtn)  newBtn.style.display  = '';
+    if (joinBtn) joinBtn.style.display = '';
+
+    // Sub-tab görünürlüğünü koru — arşiv açıksa listeye dokunma
+    const archive = document.getElementById('dmusig2Archive');
+    const list    = document.getElementById('dmusig2SessionList');
+    if (archive && archive.style.display !== 'none') {
+      // Arşiv sekmesi aktif — listeye dokunma
+    } else {
+      if (list) list.style.display = '';
+    }
+
     dLoadSessionList();
     // Phase 3: pubkey biliniyorsa polling'i başlat ve hemen bir tick çalıştır
     if (state.myPubkey) { dStartPolling(); _dPollTick(); }
@@ -941,9 +969,15 @@ function _dDashCard(entry) {
           <span style="font-size:0.75em;color:${netColor}">${entry.network}</span>
           ${dStateBadge(entry.state)}
         </div>
-        <div style="color:${isActive ? '#f0883e' : '#8b949e'};font-size:0.85em">${actionLabel}</div>
+        ${isActive
+          ? `<div style="color:#f0883e;font-size:0.85em;cursor:pointer;text-decoration:underline" onclick="dOpenSession('${entry.session_id}')">${actionLabel}</div>`
+          : `<div style="color:#8b949e;font-size:0.85em">${actionLabel}</div>`
+        }
         ${participantRow}
         ${expiryRow}
+        ${entry.source_session_id
+          ? `<div style="font-size:10px;color:var(--blue);margin-top:2px">↩ Para üstü işlemi</div>`
+          : ''}
       </div>
       <button class="btn btn-ghost sm" onclick="dOpenSession('${entry.session_id}')" style="white-space:nowrap;align-self:center">Aç →</button>
     </div>`;
@@ -1063,6 +1097,357 @@ function dStateBadge(s) {
   return `<span class="badge ${cls}">${label}</span>`;
 }
 
+// ── Arşiv ──────────────────────────────────────────────────────────────────
+
+function dShowSubTab(tab) {
+  const isActive = tab === 'active';
+  const dashboard = document.getElementById('dmusig2Dashboard');
+  const list      = document.getElementById('dmusig2SessionList');
+  const archive   = document.getElementById('dmusig2Archive');
+  const detail    = document.getElementById('dmusig2Detail');
+
+  if (dashboard) dashboard.style.display = isActive ? '' : 'none';
+  if (list)      list.style.display      = isActive ? '' : 'none';
+  if (archive)   archive.style.display   = isActive ? 'none' : '';
+  if (detail && detail.style.display !== 'none') detail.style.display = 'none';
+
+  const btnA = document.getElementById('dSubTabActive');
+  const btnB = document.getElementById('dSubTabArchive');
+  if (btnA) {
+    btnA.style.borderBottomColor = isActive ? 'var(--orange)' : 'transparent';
+    btnA.style.color             = isActive ? 'var(--orange)' : 'var(--text-2)';
+  }
+  if (btnB) {
+    btnB.style.borderBottomColor = !isActive ? 'var(--orange)' : 'transparent';
+    btnB.style.color             = !isActive ? 'var(--orange)' : 'var(--text-2)';
+  }
+
+  if (!isActive && !state.archiveSessions.length) {
+    dArchiveLoad();
+  }
+}
+
+async function dArchiveLoad() {
+  try {
+    const all = await get('/api/musig2d/list');
+    state.archiveSessions = all
+      .filter(s => s.state === 'BROADCAST' || s.state === 'SIGNED')
+      .sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
+    const badge = document.getElementById('dArchiveBadge');
+    if (badge) badge.textContent = state.archiveSessions.length || '';
+    state.archivePage = 1;
+    dArchiveRender();
+  } catch(e) {
+    uiLog('Arşiv yüklenemedi: ' + e.message, 'ERR');
+    toast('Arşiv yüklenemedi', 'error');
+  }
+}
+
+function dArchiveRender() {
+  const search = (document.getElementById('dArchiveSearch')?.value || '').toLowerCase().trim();
+  const net    = document.getElementById('dArchiveNet')?.value || '';
+  const minAmt = parseInt(document.getElementById('dArchiveMinAmt')?.value) || 0;
+  const maxAmt = parseInt(document.getElementById('dArchiveMaxAmt')?.value) || Infinity;
+
+  state.archiveFiltered = state.archiveSessions.filter(s => {
+    if (net && s.network !== net) return false;
+    if (minAmt && (s.amount_sat || 0) < minAmt) return false;
+    if (maxAmt !== Infinity && (s.amount_sat || 0) > maxAmt) return false;
+    if (search) {
+      const hay = [s.label, s.txid, s.to_address, s.id].filter(Boolean).join(' ').toLowerCase();
+      if (!hay.includes(search)) return false;
+    }
+    return true;
+  });
+
+  _dArchiveUpdateChips({ search, net, minAmt, maxAmt });
+
+  const countEl = document.getElementById('dArchiveCount');
+  if (countEl) countEl.textContent = state.archiveFiltered.length ? state.archiveFiltered.length + ' session' : '';
+
+  const total  = state.archiveFiltered.length;
+  const pages  = Math.max(1, Math.ceil(total / state.archivePageSize));
+  if (state.archivePage > pages) state.archivePage = 1;
+  const start    = (state.archivePage - 1) * state.archivePageSize;
+  const pageData = state.archiveFiltered.slice(start, start + state.archivePageSize);
+
+  const emptyEl = document.getElementById('dArchiveEmpty');
+  const tableEl = document.getElementById('dArchiveTable');
+
+  if (!total) {
+    if (emptyEl) emptyEl.style.display = '';
+    if (tableEl) tableEl.style.display = 'none';
+    document.getElementById('dArchivePager').innerHTML = '';
+    return;
+  }
+
+  if (emptyEl) emptyEl.style.display = 'none';
+  if (tableEl) tableEl.style.display = '';
+
+  const explorerBase = n => n === 'mainnet'
+    ? 'https://mempool.space/tx/'
+    : 'https://mempool.space/testnet4/tx/';
+
+  document.getElementById('dArchiveBody').innerHTML = pageData.map(s => {
+    const dateStr   = s.created_at ? new Date(s.created_at * 1000).toLocaleString('tr-TR') : '—';
+    const txShort   = s.txid ? s.txid.substring(0, 16) + '…' : '—';
+    const amtStr    = s.amount_sat != null ? s.amount_sat.toLocaleString() + ' sat' : '—';
+    const addrShort = s.to_address ? s.to_address.substring(0, 14) + '…' : '—';
+    const netColor  = s.network === 'mainnet' ? 'var(--red)' : 'var(--text-3)';
+    const badge     = s.state === 'BROADCAST'
+      ? '<span class="badge badge-green">✓ Yayınlandı</span>'
+      : '<span class="badge badge-yellow">İmzalandı</span>';
+    const txidActions = s.txid
+      ? `<button class="btn btn-ghost sm" style="margin-left:4px;padding:2px 6px;font-size:11px"
+           onclick="event.stopPropagation();copyToClipboard('${s.txid}');toast('TXID kopyalandı','success')"
+           title="TXID kopyala">⎘</button>
+         <a class="btn btn-ghost sm" style="margin-left:2px;padding:2px 6px;font-size:11px"
+           href="${explorerBase(s.network)}${s.txid}" target="_blank"
+           onclick="event.stopPropagation()">↗</a>`
+      : '';
+    const feeRow = s.fee_sat ? `<div class="mono-xs" style="color:var(--text-3)">fee: ${s.fee_sat.toLocaleString()} sat</div>` : '';
+
+    return `
+      <tr onclick="dArchiveOpenDetail('${s.id}')">
+        <td><span class="bold">${s.label}</span></td>
+        <td><span class="mono-xs" style="color:${netColor}">${s.network}</span></td>
+        <td><span class="mono-xs">${txShort}</span>${txidActions}</td>
+        <td style="font-size:12px;color:var(--text-3);white-space:nowrap">${dateStr}</td>
+        <td><span class="orange bold">${amtStr}</span>${feeRow}</td>
+        <td class="d-hide-mobile">
+          <span class="mono-xs" style="max-width:120px;display:inline-block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"
+            title="${s.to_address || ''}">${addrShort}</span>
+        </td>
+        <td>${badge}</td>
+        <td>
+          <button class="btn btn-ghost sm" style="white-space:nowrap"
+            onclick="event.stopPropagation();dArchiveOpenDetail('${s.id}')">Aç →</button>
+        </td>
+      </tr>`;
+  }).join('');
+
+  _dArchiveRenderPager(pages);
+}
+
+function _dArchiveRenderPager(pages) {
+  const pager = document.getElementById('dArchivePager');
+  if (!pager) return;
+  if (pages <= 1) { pager.innerHTML = ''; return; }
+  const p = state.archivePage;
+  pager.innerHTML =
+    `<button class="btn btn-ghost sm" ${p === 1 ? 'disabled style="opacity:.4"' : ''}
+       onclick="state.archivePage=${p-1};dArchiveRender()">← Önceki</button>` +
+    `<span style="font-size:12px;color:var(--text-3);padding:0 10px">${p} / ${pages}</span>` +
+    `<button class="btn btn-ghost sm" ${p === pages ? 'disabled style="opacity:.4"' : ''}
+       onclick="state.archivePage=${p+1};dArchiveRender()">Sonraki →</button>`;
+}
+
+function _dArchiveUpdateChips({ search, net, minAmt, maxAmt }) {
+  const chips = [];
+  if (search) chips.push({ label: '🔍 ' + search, clear: "document.getElementById('dArchiveSearch').value='';dArchiveRender()" });
+  if (net)    chips.push({ label: 'Ağ: ' + net,   clear: "document.getElementById('dArchiveNet').value='';dArchiveRender()" });
+  if (minAmt) chips.push({ label: '≥ ' + minAmt.toLocaleString() + ' sat', clear: "document.getElementById('dArchiveMinAmt').value='';dArchiveRender()" });
+  if (maxAmt !== Infinity && maxAmt) chips.push({ label: '≤ ' + maxAmt.toLocaleString() + ' sat', clear: "document.getElementById('dArchiveMaxAmt').value='';dArchiveRender()" });
+
+  const container = document.getElementById('dArchiveChips');
+  if (!container) return;
+  if (!chips.length) { container.style.display = 'none'; return; }
+  container.style.display = 'flex';
+  container.innerHTML = chips.map(c =>
+    `<span class="filter-chip">${c.label}
+       <button class="filter-chip-remove" onclick="${c.clear}" title="Kaldır">×</button>
+     </span>`
+  ).join('') +
+  `<button class="btn btn-ghost sm" onclick="dArchiveClearFilters()" style="font-size:11px;padding:2px 8px">Tümünü Temizle</button>`;
+}
+
+function dArchiveClearFilters() {
+  ['dArchiveSearch', 'dArchiveMinAmt', 'dArchiveMaxAmt'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.value = '';
+  });
+  const net = document.getElementById('dArchiveNet');
+  if (net) net.value = '';
+  state.archivePage = 1;
+  dArchiveRender();
+}
+
+function dArchiveOpenDetail(sid) {
+  state._archiveOpenedDetail = true;
+  showTab('musig2d');
+  dOpenSession(sid);
+}
+
+// ── Para Üstü Hızlı Session ────────────────────────────────────────────────
+
+async function dCheckChangeBalance(s) {
+  const card    = document.getElementById('dmusig2ChangeCard');
+  const actions = document.getElementById('dmusig2ChangeActions');
+  if (!card || !s.agg_address) { if (card) card.style.display = 'none'; return; }
+  try {
+    const bal = await get(`/api/wallet/${s.agg_address}/balance`);
+    if (!bal.confirmed_sat || bal.confirmed_sat <= 0) {
+      card.style.display = 'none';
+      return;
+    }
+    card.style.display = 'flex';
+    document.getElementById('dmusig2ChangeAmount').textContent =
+      bal.confirmed_sat.toLocaleString() + ' sat onaylı';
+    document.getElementById('dmusig2ChangeAddr').textContent = s.agg_address;
+
+    if (actions) {
+      if (state.myRole === 'coordinator') {
+        actions.innerHTML = `<button class="btn btn-primary" onclick="dOpenQuickSessionModal()">⚡ Yeni İşlem Başlat →</button>`;
+      } else {
+        actions.innerHTML = `<span style="font-size:12px;color:var(--text-3)">⌛ Koordinatör yeni işlemi başlatacak</span>`;
+      }
+    }
+    state._changeBalance = bal.confirmed_sat;
+  } catch(_) {
+    if (card) card.style.display = 'none';
+  }
+}
+
+function dOpenQuickSessionModal() {
+  const s = state.dmusig2Session;
+  if (!s) return;
+
+  const pEl = document.getElementById('qsParticipants');
+  if (pEl) {
+    pEl.innerHTML = s.participants.map(p => `
+      <div style="display:flex;align-items:center;gap:10px;padding:4px 0;border-bottom:1px solid var(--border)">
+        <span style="min-width:90px;font-size:12px;color:var(--text-2)">${p.label}</span>
+        <span class="mono-xs" style="color:var(--text-3)">${p.pubkey ? p.pubkey.substring(0,20) + '…' : '—'}</span>
+        <span style="font-size:10px;color:var(--text-3);margin-left:auto">🔒 kilitli</span>
+      </div>`).join('');
+  }
+
+  const txidEl    = document.getElementById('qsSourceTxid');
+  const explorerEl = document.getElementById('qsSourceExplorer');
+  if (txidEl) txidEl.textContent = s.txid ? s.txid.substring(0, 24) + '…' : s.id;
+  if (explorerEl && s.txid) {
+    const base = s.network === 'mainnet' ? 'https://mempool.space/tx/' : 'https://mempool.space/testnet4/tx/';
+    explorerEl.href = base + s.txid;
+  }
+
+  const balEl = document.getElementById('qsAvailableBalance');
+  if (balEl) balEl.textContent = (state._changeBalance || 0).toLocaleString() + ' sat';
+
+  const labelEl = document.getElementById('qsLabel');
+  if (labelEl) labelEl.value = s.label + ' Devam';
+
+  ['qsDescription','qsToAddr','qsAmount'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.value = '';
+  });
+
+  openModal('quickSessionModal');
+}
+
+function dQuickSessionFillMax() {
+  const bal = state._changeBalance || 0;
+  const fee = parseInt(document.getElementById('qsFee')?.value) || 500;
+  const max = bal - fee;
+  if (max > 546) {
+    document.getElementById('qsAmount').value = max;
+  } else {
+    toast('Bakiye yetersiz', 'error');
+  }
+}
+
+async function dQuickSessionCreate() {
+  const s = state.dmusig2Session;
+  if (!s) return;
+
+  const toAddr = document.getElementById('qsToAddr')?.value.trim();
+  const amount = parseInt(document.getElementById('qsAmount')?.value);
+  const fee    = parseInt(document.getElementById('qsFee')?.value) || 500;
+  const desc   = document.getElementById('qsDescription')?.value.trim() || '';
+  const label  = document.getElementById('qsLabel')?.value.trim() || s.label + ' Devam';
+
+  if (!toAddr) { toast('Hedef adres girin', 'error'); return; }
+  if (!amount || amount < 546) { toast('Geçerli tutar girin (min 546 sat)', 'error'); return; }
+
+  try {
+    const newSession = await post('/api/musig2d/new', {
+      label,
+      n_participants: s.n,
+      network: s.network,
+      source_session_id: s.id,
+    });
+
+    const myIdx = state.myIndex ?? 0;
+    const mySk  = localStorage.getItem(D_SK_KEY(s.id));
+    if (!mySk) { toast('SK bulunamadı — oturumu yeniden açın', 'error'); return; }
+    const myPk  = MuSig2D.derivePublicKey(mySk);
+
+    await post(`/api/musig2d/${newSession.id}/register`, {
+      participant_index: myIdx,
+      pubkey_hex: myPk,
+    });
+
+    for (const p of s.participants) {
+      if (p.index === myIdx || !p.pubkey) continue;
+      await post(`/api/musig2d/${newSession.id}/register`, {
+        participant_index: p.index,
+        pubkey_hex: p.pubkey,
+      });
+    }
+
+    localStorage.setItem(D_SK_KEY(newSession.id), mySk);
+    localStorage.setItem(D_IDX_KEY(newSession.id), String(myIdx));
+
+    closeModal('quickSessionModal');
+    toast('Yeni session oluşturuldu — TX aşamasına hazır', 'success');
+
+    await dOpenSession(newSession.id);
+
+    if (state.myRole === 'coordinator') {
+      const toEl  = document.getElementById('dmusig2TxTo');
+      const amtEl = document.getElementById('dmusig2TxAmount');
+      const feeEl = document.getElementById('dmusig2TxFee');
+      const dscEl = document.getElementById('dmusig2TxDesc');
+      if (toEl)  toEl.value  = toAddr;
+      if (amtEl) amtEl.value = amount;
+      if (feeEl) feeEl.value = fee;
+      if (dscEl) dscEl.value = desc;
+      document.getElementById('dmusig2TxCard')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  } catch(e) {
+    toast(`Hata: ${e.message}`, 'error');
+  }
+}
+
+function dExport(type) {
+  document.getElementById('dExportMenu').style.display = 'none';
+  const CSV_COLS = ['id','label','network','state','txid','amount_sat','fee_sat','to_address','agg_xonly','description','created_at'];
+  const source = type === 'json-all' ? state.archiveSessions : state.archiveFiltered;
+  if (!source.length) { toast('Dışa aktarılacak kayıt yok', 'error'); return; }
+
+  const escape = v => {
+    const str = v == null ? '' : String(v);
+    return (str.includes(',') || str.includes('"') || str.includes('\n'))
+      ? '"' + str.replace(/"/g, '""') + '"' : str;
+  };
+
+  let blob, filename;
+  if (type === 'csv') {
+    const rows = [CSV_COLS.join(','), ...source.map(s => CSV_COLS.map(k => escape(s[k])).join(','))];
+    blob = new Blob([rows.join('\n')], { type: 'text/csv;charset=utf-8' });
+    filename = 'musig2-archive-' + new Date().toISOString().slice(0, 10) + '.csv';
+  } else {
+    blob = new Blob([JSON.stringify(source, null, 2)], { type: 'application/json' });
+    filename = 'musig2-archive-' + new Date().toISOString().slice(0, 10) + '.json';
+  }
+
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click();
+  document.body.removeChild(a); URL.revokeObjectURL(url);
+  toast('İndirildi: ' + filename, 'success');
+}
+
 // ── Oturum Listesi ─────────────────────────────────────────────────────────
 
 async function dLoadSessionList() {
@@ -1099,6 +1484,11 @@ async function dLoadSessionList() {
           </tbody>
         </table>
       </div>`;
+
+    // 4L: Arşiv badge'ini güncelle
+    const archived = sessions.filter(s => s.state === 'BROADCAST' || s.state === 'SIGNED');
+    const badge = document.getElementById('dArchiveBadge');
+    if (badge) badge.textContent = archived.length ? String(archived.length) : '';
   } catch(e) {
     uiLog(`Dağıtık MuSig2 listesi yüklenemedi: ${e.message}`, 'ERR');
   }
@@ -1148,6 +1538,7 @@ async function dOpenSession(sid) {
     document.getElementById('dmusig2Detail').style.display = '';
 
     dRenderSession(s);
+    document.getElementById('dmusig2Detail').scrollIntoView({ behavior: 'smooth', block: 'start' });
     document.querySelector('.page-header button[onclick="dOpenNewSessionModal()"]').style.display = 'none';
     document.querySelector('.page-header button[onclick="openModal(\'dJoinSessionModal\')"]').style.display = 'none';
   } catch(e) {
@@ -1157,11 +1548,22 @@ async function dOpenSession(sid) {
 
 function dCloseDetail() {
   document.getElementById('dmusig2Detail').style.display = 'none';
-  document.getElementById('dmusig2SessionList').style.display = '';
-  document.querySelector('.page-header button[onclick="dOpenNewSessionModal()"]').style.display = '';
-  document.querySelector('.page-header button[onclick="openModal(\'dJoinSessionModal\')"]').style.display = '';
+
+  const newBtn  = document.querySelector('.page-header button[onclick="dOpenNewSessionModal()"]');
+  const joinBtn = document.querySelector('.page-header button[onclick="openModal(\'dJoinSessionModal\')"]');
+  if (newBtn)  newBtn.style.display  = '';
+  if (joinBtn) joinBtn.style.display = '';
+
   state.dmusig2Session = null;
-  dLoadSessionList();
+
+  if (state._archiveOpenedDetail) {
+    state._archiveOpenedDetail = false;
+    document.getElementById('dmusig2SessionList').style.display = 'none';
+    dShowSubTab('archive');
+  } else {
+    document.getElementById('dmusig2SessionList').style.display = '';
+    dLoadSessionList();
+  }
 }
 
 function dRenderSession(s) {
@@ -1185,6 +1587,21 @@ function dRenderSession(s) {
     }
   }
 
+  // 3F: Kaynak session referansı
+  const srcRef   = document.getElementById('dmusig2SourceRef');
+  const srcTxid  = document.getElementById('dmusig2SourceTxid');
+  if (srcRef) {
+    if (s.source_session_id) {
+      srcRef.style.display = '';
+      if (srcTxid) {
+        srcTxid.textContent = s.source_session_id.substring(0, 8) + '…';
+        srcTxid.title       = s.source_session_id;
+      }
+    } else {
+      srcRef.style.display = 'none';
+    }
+  }
+
   // Fix 1: Güvenli bağlam uyarısı
   const cryptoStatus = MuSig2D.secureContextStatus();
   document.getElementById('dmusig2CryptoWarning').style.display =
@@ -1201,18 +1618,70 @@ function dRenderSession(s) {
     aggCard.style.display = 'none';
   }
 
+  // Adım göstergesi
+  const STEPS = [
+    { label: 'Pubkey',  states: ['COLLECTING_PUBKEYS'] },
+    { label: 'TX',      states: ['READY_FOR_TX'] },
+    { label: 'Nonce',   states: ['COLLECTING_NONCES'] },
+    { label: 'İmza',    states: ['COLLECTING_SIGS'] },
+    { label: 'Yayınla', states: ['SIGNED', 'BROADCAST'] },
+  ];
+  const currentStep     = STEPS.findIndex(step => step.states.includes(s.state));
+  const aggregateFailed = s.state === 'COLLECTING_SIGS' &&
+    s.participants.every(p => p.partial_sigs?.length > 0 && p.partial_sigs?.[0] !== null);
+
+  const stepBarEl = document.getElementById('dmusig2StepBar');
+  if (stepBarEl) {
+    stepBarEl.innerHTML = `
+      <div style="display:flex;align-items:center;margin-bottom:16px">
+        ${STEPS.map((step, i) => {
+          const done   = i < currentStep;
+          const active = i === currentStep;
+          const error  = active && aggregateFailed;
+          const color  = done  ? '#3fb950'
+                       : error ? '#f85149'
+                       : active ? '#f0883e'
+                       : '#30363d';
+          const textColor = (done || active) ? '#e6edf3' : '#484f58';
+          const anim = error ? 'animation:pulse 1.5s infinite' : '';
+          const connector = i < STEPS.length - 1
+            ? `<div style="height:2px;flex:1;margin-bottom:18px;background:${i < currentStep ? '#3fb950' : '#30363d'}"></div>`
+            : '';
+          return `
+            <div style="display:flex;align-items:center;flex:1">
+              <div style="display:flex;flex-direction:column;align-items:center;flex:1;gap:4px">
+                <div style="width:28px;height:28px;border-radius:50%;background:${color};
+                  display:flex;align-items:center;justify-content:center;
+                  font-size:0.75em;font-weight:700;color:#0d1117;${anim}">
+                  ${done ? '✓' : error ? '!' : i + 1}
+                </div>
+                <span style="font-size:0.7em;color:${textColor};white-space:nowrap">${step.label}</span>
+              </div>
+              ${connector}
+            </div>`;
+        }).join('')}
+      </div>`;
+  }
+
   // Katılımcı tablosu
   const tbody = document.getElementById('dmusig2ParticipantTable');
   tbody.innerHTML = s.participants.map((p, i) => {
     const pkShort = p.pubkey ? p.pubkey.slice(0,12) + '…' : '—';
-    const nonceOk = p.pubnonces && p.pubnonces.length > 0 && p.pubnonces[0] !== null;
-    const sigOk   = p.partial_sigs && p.partial_sigs.length > 0 && p.partial_sigs[0] !== null;
-    return `<tr>
+    const nonceOk = p.pubnonces?.length > 0 && p.pubnonces?.[0] !== null;
+    const sigOk   = p.partial_sigs?.length > 0 && p.partial_sigs?.[0] !== null;
+    const nonceIcon = nonceOk ? '<span style="color:#3fb950">✓</span>' : '—';
+    const sigIcon   = sigOk
+      ? (aggregateFailed
+          ? '<span title="Gönderildi fakat aggregate başarısız" style="color:#d29922">⚠</span>'
+          : '<span style="color:#3fb950">✓</span>')
+      : '—';
+    const rowStyle = aggregateFailed && sigOk ? 'background:#1a1000;' : '';
+    return `<tr style="${rowStyle}">
       <td>${i+1}</td>
       <td>${p.label}</td>
       <td class="mono-sm" style="font-size:0.78em">${pkShort}</td>
-      <td>${nonceOk ? '<span style="color:#3fb950">✓</span>' : '—'}</td>
-      <td>${sigOk   ? '<span style="color:#3fb950">✓</span>' : '—'}</td>
+      <td>${nonceIcon}</td>
+      <td>${sigIcon}</td>
     </tr>`;
   }).join('');
 
@@ -1300,6 +1769,32 @@ function dRenderSession(s) {
   if (s.state === 'SIGNED' || s.state === 'BROADCAST') {
     signedCard.style.display = '';
     document.getElementById('dmusig2TxHex').value = s.tx_hex || '';
+
+    // Yayınla butonu: BROADCAST state'te gizle
+    const broadcastBtn = document.getElementById('dmusig2BroadcastBtn');
+    if (broadcastBtn) broadcastBtn.style.display = s.state === 'BROADCAST' ? 'none' : '';
+
+    // 4J: TXID kalıcı satırı
+    const txidRow      = document.getElementById('dmusig2TxidRow');
+    const txidVal      = document.getElementById('dmusig2TxidValue');
+    const txidExplorer = document.getElementById('dmusig2TxidExplorer');
+    if (txidRow) {
+      if (s.txid) {
+        txidRow.style.display = '';
+        if (txidVal)      txidVal.textContent = s.txid;
+        if (txidExplorer) {
+          const base = s.network === 'mainnet'
+            ? 'https://mempool.space/tx/'
+            : 'https://mempool.space/testnet4/tx/';
+          txidExplorer.href = base + s.txid;
+        }
+      } else {
+        txidRow.style.display = 'none';
+      }
+    }
+
+    // 3A: Kalan bakiyeyi kontrol et
+    if (s.state === 'BROADCAST') dCheckChangeBalance(s);
   } else {
     signedCard.style.display = 'none';
   }
@@ -1326,7 +1821,9 @@ function dRenderActionButtons(s) {
   }
   if (s.state === 'COLLECTING_NONCES') {
     // Kendi nonce'u yoksa göster
-    const hasNonce = isKnown && s.participants[myIdx]?.pubnonces?.length > 0;
+    const hasNonce = isKnown &&
+      s.participants[myIdx]?.pubnonces?.length > 0 &&
+      s.participants[myIdx]?.pubnonces?.[0] !== null;
     if (!hasNonce) {
       btns.push(`<button class="btn btn-primary" onclick="dSubmitNonce()">Nonce Üret & Gönder</button>`);
     } else {
@@ -1334,9 +1831,52 @@ function dRenderActionButtons(s) {
     }
   }
   if (s.state === 'COLLECTING_SIGS') {
-    // Kendi imzası yoksa göster
-    const hasSig = isKnown && s.participants[myIdx]?.partial_sigs?.length > 0;
-    if (!hasSig) {
+    const hasSig = isKnown &&
+      s.participants[myIdx]?.partial_sigs?.length > 0 &&
+      s.participants[myIdx]?.partial_sigs?.[0] !== null;
+    const allSigsPresent = s.participants.every(
+      p => p.partial_sigs?.length > 0 && p.partial_sigs?.[0] !== null
+    );
+    if (allSigsPresent) {
+      // Tüm imzalar toplandı ama aggregate başarısız — inline hata paneli
+      btns.push(`
+        <div style="background:#1a0a0a;border:1px solid #f85149;border-radius:6px;
+          padding:10px 14px;margin-bottom:8px;font-size:0.85em">
+          <div style="color:#f85149;font-weight:600;margin-bottom:4px">⚠ İmzalama tamamlanamadı</div>
+          <div style="color:#8b949e;line-height:1.5">
+            Her iki katılımcının imzası uyumsuz çıktı.
+            Koordinatör nonce sıfırlamalı, ardından her iki taraf yeniden nonce ve imza göndermelidir.
+          </div>
+          <details style="margin-top:6px">
+            <summary style="color:#484f58;cursor:pointer;font-size:0.9em">Teknik detay</summary>
+            <code style="color:#484f58;font-size:0.8em">Schnorr aggregate doğrulaması başarısız (Q_even_y uyumsuzluğu)</code>
+          </details>
+        </div>`);
+      if (isCoord) {
+        btns.push(`
+          <div id="retryConfirmBox" style="display:none;background:#1a0a0a;border:1px solid #d29922;
+            border-radius:6px;padding:10px 14px;margin-bottom:8px;font-size:0.84em;color:#d29922">
+            Bu işlem her iki katılımcının nonce ve imzasını siler.
+            Koordinatör yeni nonce gönderince diğer katılımcı da otomatik uyarılır.
+            Devam edilsin mi?
+            <div style="margin-top:8px;display:flex;gap:8px">
+              <button class="btn btn-danger sm" onclick="dResetAndRetry()">Evet, Sıfırla</button>
+              <button class="btn btn-ghost sm"
+                onclick="document.getElementById('retryConfirmBox').style.display='none';
+                         document.getElementById('retryBtn').style.display=''">
+                Vazgeç
+              </button>
+            </div>
+          </div>
+          <button id="retryBtn" class="btn btn-orange" onclick="
+            document.getElementById('retryBtn').style.display='none';
+            document.getElementById('retryConfirmBox').style.display=''">
+            ↺ Nonce Sıfırla & Yeniden Dene
+          </button>`);
+      } else {
+        btns.push(`<span style="color:#8b949e;font-size:0.85em">⌛ Koordinatör nonce sıfırlamasını başlatmayı bekleyin</span>`);
+      }
+    } else if (!hasSig) {
       btns.push(`<button class="btn btn-primary" onclick="dSubmitPartialSig()">Kısmi İmza Üret & Gönder</button>`);
     } else {
       btns.push(`<span style="color:#8b949e;font-size:0.85em">⌛ Diğer imzalar bekleniyor</span>`);
@@ -1384,6 +1924,15 @@ function dUpdatePkDisplay() {
 // sk input değişince pubkey'i güncelle
 document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('dmusig2MySkInput').addEventListener('input', dUpdatePkDisplay);
+
+  // 4N: Export menüsünü tıklama dışına basınca kapat
+  document.addEventListener('click', e => {
+    const menu   = document.getElementById('dExportMenu');
+    const toggle = document.getElementById('dExportToggle');
+    if (menu && toggle && !toggle.contains(e.target)) {
+      menu.style.display = 'none';
+    }
+  });
 });
 
 // ── Pubkey Kaydet ──────────────────────────────────────────────────────────
@@ -1528,9 +2077,65 @@ async function dSubmitPartialSig() {
       toast('Kısmi imza gönderildi', 'success');
     }
   } catch(e) {
-    toast(`Kısmi imza başarısız: ${e.message}`, 'error');
     uiLog(`partial_sig hata: ${e.message}`, 'ERR');
-    // Nonce'lar localStorage'da kaldı — kullanıcı tekrar imzalayabilir
+    // Toast kaldırıldı — hata UI'ı dRenderActionButtons üstleniyor
+    // Backend sig'i kaydetmiş olabilir; güncel state'i çek
+    try {
+      const refreshed = await get(`/api/musig2d/${s.id}`);
+      state.dmusig2Session = refreshed;
+      dRenderSession(refreshed);
+    } catch(_) {}
+  }
+}
+
+// ── Nonce Sıfırla & Yeniden Dene ───────────────────────────────────────────
+
+async function dResetAndRetry() {
+  const s = state.dmusig2Session;
+  if (!s) return;
+
+  const counterKey = `dmusig2_retry_${s.id}`;
+  const retryCount = parseInt(sessionStorage.getItem(counterKey) || '0');
+  const newCount   = retryCount + 1;
+  sessionStorage.setItem(counterKey, String(newCount));
+
+  // 5. denemeden sonra — yeni oturum yönlendirmesi
+  if (newCount > 5) {
+    document.getElementById('dmusig2ActionButtons').innerHTML = `
+      <div style="background:#1a0505;border:1px solid #f85149;border-radius:6px;
+        padding:12px 14px;font-size:0.85em">
+        <div style="color:#f85149;font-weight:600;margin-bottom:6px">
+          ⛔ Tekrarlayan imzalama hatası (${newCount}. deneme)
+        </div>
+        <div style="color:#8b949e;margin-bottom:10px">
+          Bu oturumda imzalama defalarca başarısız oldu.
+          Muhtemelen kalıcı bir kriptografik uyumsuzluk var.
+          Yeni oturum açmanız önerilir.
+        </div>
+        <button class="btn btn-ghost sm" onclick="dCloseDetail()">← Oturum Listesine Dön</button>
+      </div>`;
+    return;
+  }
+
+  if (newCount === 3) {
+    uiLog(`Uyarı: ${s.label} için ${newCount}. nonce sıfırlama denemesi`, 'WARN');
+  }
+
+  try {
+    const updated = await post(`/api/musig2d/${s.id}/reset-nonces`, {});
+    for (let i = 0; i < (s.sighashes?.length || 1); i++) {
+      localStorage.removeItem(D_NONCE_KEY(s.id, i));
+    }
+    state.dmusig2Session = updated;
+    dRenderSession(updated);
+    toast(
+      newCount >= 3
+        ? `Sıfırlandı (${newCount}. deneme) — dikkatli ilerleyin`
+        : "Nonce'lar sıfırlandı — yeniden nonce gönderin",
+      newCount >= 3 ? '' : 'success'
+    );
+  } catch(e) {
+    toast(`Sıfırlama başarısız: ${e.message}`, 'error');
   }
 }
 
@@ -1544,6 +2149,7 @@ async function dBroadcast() {
   result.className = 'broadcast-result';
   try {
     const res = await post(`/api/musig2d/${s.id}/broadcast`, {});
+    if (res.txid) state.dmusig2Session.txid = res.txid;  // 4K: local state'e yaz
     result.textContent = `✓ TXID: ${res.txid}`;
     result.className = 'broadcast-result success';
     toast('Transaction yayınlandı!', 'success');

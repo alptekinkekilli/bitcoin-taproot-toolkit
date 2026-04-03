@@ -227,6 +227,58 @@
           <button class="btn btn-primary" onclick="dOpenNewSessionModal()">+ Yeni Oturum</button>
         </div>
 
+        <!-- Sub-tab bar: Aktif / Arşiv -->
+        <div id="dmusig2SubTabs" style="
+          display:flex;
+          gap:0;
+          border-bottom:1px solid var(--border);
+          margin-bottom:24px;
+        ">
+          <button
+            id="dSubTabActive"
+            onclick="dShowSubTab('active')"
+            style="
+              background:transparent;
+              border:none;
+              border-radius:0;
+              border-bottom:2px solid var(--orange);
+              color:var(--orange);
+              padding:10px 20px;
+              font-size:13px;
+              font-weight:600;
+              cursor:pointer;
+              transition:color .15s, border-color .15s;
+            "
+          >Aktif</button>
+
+          <button
+            id="dSubTabArchive"
+            onclick="dShowSubTab('archive')"
+            style="
+              background:transparent;
+              border:none;
+              border-radius:0;
+              border-bottom:2px solid transparent;
+              color:var(--text-2);
+              padding:10px 20px;
+              font-size:13px;
+              font-weight:600;
+              cursor:pointer;
+              transition:color .15s, border-color .15s;
+            "
+          >
+            Arşiv
+            <span id="dArchiveBadge" style="
+              background:var(--bg-4);
+              color:var(--text-3);
+              border-radius:20px;
+              padding:1px 7px;
+              font-size:10px;
+              margin-left:4px;
+            "></span>
+          </button>
+        </div>
+
         <!-- Açıklama -->
         <div class="card" style="margin-bottom:16px;background:#0d1117;border-color:#21262d">
           <p style="margin:0;color:#8b949e;font-size:0.87em;line-height:1.6">
@@ -271,6 +323,123 @@
           <div class="empty-state">Henüz dağıtık MuSig2 oturumu yok.<br>Yeni bir oturum oluşturun.</div>
         </div>
 
+        <!-- Arşiv container -->
+        <div id="dmusig2Archive" style="display:none">
+
+          <!-- Filtre Bar -->
+          <div style="
+            background:var(--bg-2);
+            border:1px solid var(--border);
+            border-radius:var(--radius-lg);
+            padding:14px 16px;
+            margin-bottom:12px;
+          ">
+            <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:flex-end;">
+
+              <div style="flex:2; min-width:180px;">
+                <label class="form-label">Ara</label>
+                <input id="dArchiveSearch" class="form-input" type="text"
+                  placeholder="Etiket, TXID veya adres…"
+                  oninput="dArchiveRender()">
+              </div>
+
+              <div style="min-width:120px;">
+                <label class="form-label">Ağ</label>
+                <select id="dArchiveNet" class="form-select" onchange="dArchiveRender()">
+                  <option value="">Tümü</option>
+                  <option value="testnet4">testnet4</option>
+                  <option value="mainnet">mainnet</option>
+                </select>
+              </div>
+
+              <div style="min-width:110px;">
+                <label class="form-label">Min (sat)</label>
+                <input id="dArchiveMinAmt" class="form-input" type="number"
+                  placeholder="0" oninput="dArchiveRender()">
+              </div>
+
+              <div style="min-width:110px;">
+                <label class="form-label">Max (sat)</label>
+                <input id="dArchiveMaxAmt" class="form-input" type="number"
+                  placeholder="∞" oninput="dArchiveRender()">
+              </div>
+
+              <div>
+                <label class="form-label" style="visibility:hidden">_</label>
+                <button class="btn btn-ghost sm" onclick="dArchiveClearFilters()">Temizle</button>
+              </div>
+
+              <!-- Export dropdown -->
+              <div style="margin-left:auto; position:relative;">
+                <label class="form-label" style="visibility:hidden">_</label>
+                <div>
+                  <button id="dExportToggle" class="btn btn-ghost sm"
+                    onclick="var m=document.getElementById('dExportMenu');m.style.display=m.style.display==='block'?'none':'block'"
+                  >↓ İndir ▾</button>
+
+                  <div id="dExportMenu" style="
+                    display:none;
+                    position:absolute;
+                    right:0;
+                    top:calc(100% + 4px);
+                    background:var(--bg-3);
+                    border:1px solid var(--border);
+                    border-radius:var(--radius);
+                    z-index:50;
+                    min-width:190px;
+                    box-shadow:0 8px 24px rgba(0,0,0,.5);
+                  ">
+                    <button onclick="dExport('csv')" style="display:block;width:100%;text-align:left;background:transparent;border:none;padding:9px 14px;font-size:13px;color:var(--text-2);cursor:pointer"
+                      onmouseover="this.style.background='var(--bg-4)'" onmouseout="this.style.background='transparent'">Görünenleri CSV</button>
+                    <button onclick="dExport('json')" style="display:block;width:100%;text-align:left;background:transparent;border:none;padding:9px 14px;font-size:13px;color:var(--text-2);cursor:pointer"
+                      onmouseover="this.style.background='var(--bg-4)'" onmouseout="this.style.background='transparent'">Görünenleri JSON</button>
+                    <div style="height:1px;background:var(--border);margin:2px 0;"></div>
+                    <button onclick="dExport('json-all')" style="display:block;width:100%;text-align:left;background:transparent;border:none;padding:9px 14px;font-size:13px;color:var(--text-2);cursor:pointer"
+                      onmouseover="this.style.background='var(--bg-4)'" onmouseout="this.style.background='transparent'">Tümünü JSON</button>
+                  </div>
+                </div>
+              </div>
+
+            </div><!-- /filtre satırı -->
+
+            <!-- Aktif filtre chip'leri -->
+            <div id="dArchiveChips" style="display:none;margin-top:10px;flex-wrap:wrap;gap:6px;"></div>
+
+          </div><!-- /filtre bar -->
+
+          <!-- Sonuç sayacı -->
+          <div id="dArchiveCount" style="font-size:12px;color:var(--text-3);margin-bottom:8px;"></div>
+
+          <!-- Arşiv tablosu -->
+          <div class="table-wrap">
+            <table class="data-table" id="dArchiveTable">
+              <thead>
+                <tr>
+                  <th>Etiket</th>
+                  <th>Ağ</th>
+                  <th>TXID</th>
+                  <th>Tarih</th>
+                  <th>Tutar</th>
+                  <th class="d-hide-mobile">Alıcı</th>
+                  <th>Durum</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody id="dArchiveBody"></tbody>
+            </table>
+          </div>
+
+          <!-- Sayfalama -->
+          <div id="dArchivePager" style="display:flex;gap:8px;align-items:center;justify-content:center;margin-top:12px;"></div>
+
+          <!-- Boş durum -->
+          <div id="dArchiveEmpty" class="empty-state" style="display:none;">
+            <div style="font-size:36px;margin-bottom:12px;">📭</div>
+            Henüz tamamlanmış session bulunmuyor.
+          </div>
+
+        </div><!-- /dmusig2Archive -->
+
         <!-- Oturum Detay Paneli -->
         <div id="dmusig2Detail" style="display:none">
           <div class="section-header">
@@ -289,6 +458,11 @@
               <span>Oturum ID: <code id="dmusig2Sid" style="color:#58a6ff"></code>
               <button class="btn btn-ghost sm" style="margin-left:4px" onclick="dCopySid()">⎘</button></span>
               <span id="dmusig2Expiry" style="display:none">⏱ <span id="dmusig2ExpiryText"></span></span>
+              <div id="dmusig2SourceRef" style="display:none">
+                Kaynak işlem:
+                <span id="dmusig2SourceTxid" class="mono-xs link" style="cursor:pointer"
+                  onclick="dArchiveOpenDetail(this.title)"></span>
+              </div>
             </div>
             <div id="dmusig2CryptoWarning" style="display:none;margin-top:8px;padding:6px 10px;background:#3d2000;border-radius:4px;font-size:0.8em;color:#f0883e">
               ⚠ HTTP bağlamı algılandı — WebCrypto devre dışı. Saf-JS SHA-256 kullanılıyor (fallback aktif).
@@ -305,6 +479,9 @@
               <span id="dmusig2Balance" style="font-size:0.85em;color:#3fb950;margin-left:12px"></span>
             </div>
           </div>
+
+          <!-- Adım Göstergesi -->
+          <div id="dmusig2StepBar" style="margin-bottom:8px"></div>
 
           <!-- Katılımcı Tablosu -->
           <div class="section-header"><h3>Katılımcılar</h3></div>
@@ -418,8 +595,56 @@
           <div class="card" id="dmusig2SignedCard" style="display:none">
             <div class="form-label">İmzalanmış Transaction</div>
             <textarea class="form-textarea mono-sm" id="dmusig2TxHex" readonly rows="3" style="margin-top:8px"></textarea>
+            <!-- 2C: TXID kalıcı satırı -->
+            <div id="dmusig2TxidRow" style="
+              display:none;
+              background:var(--green-dim);
+              border:1px solid var(--green);
+              border-radius:var(--radius);
+              padding:10px 14px;
+              margin-top:8px;
+              display:flex;
+              justify-content:space-between;
+              align-items:center;
+              flex-wrap:wrap;
+              gap:8px;
+            ">
+              <span style="font-size:12px;color:var(--text-3);">TXID</span>
+              <div style="display:flex;align-items:center;gap:8px;flex:1;justify-content:flex-end;">
+                <span id="dmusig2TxidValue" class="mono-xs"
+                  style="color:var(--green);word-break:break-all;text-align:right;"></span>
+                <button class="btn btn-ghost sm"
+                  onclick="copyToClipboard(document.getElementById('dmusig2TxidValue').textContent);toast('TXID kopyalandı','success')"
+                  title="TXID kopyala">⎘</button>
+                <a id="dmusig2TxidExplorer" class="btn btn-ghost sm" href="#" target="_blank">↗ Explorer</a>
+              </div>
+            </div>
+            <!-- 2A: Kalan Bakiye kartı -->
+            <div id="dmusig2ChangeCard" style="
+              display:none;
+              background:var(--bg-3);
+              border:1px solid var(--orange);
+              border-radius:var(--radius);
+              padding:12px 16px;
+              margin-top:8px;
+              flex-wrap:wrap;
+              gap:10px;
+              align-items:center;
+              justify-content:space-between;
+            ">
+              <div>
+                <div style="font-size:12px;color:var(--text-3);margin-bottom:3px">
+                  KALAN BAKİYE — Aynı taproot adresinde
+                </div>
+                <div id="dmusig2ChangeAmount"
+                  style="font-size:15px;font-weight:700;color:var(--orange)"></div>
+                <div id="dmusig2ChangeAddr"
+                  class="mono-xs" style="color:var(--text-3);margin-top:2px"></div>
+              </div>
+              <div id="dmusig2ChangeActions"></div>
+            </div>
             <div class="action-row" style="margin-top:10px">
-              <button class="btn btn-orange" onclick="dBroadcast()">⚡ Yayınla</button>
+              <button id="dmusig2BroadcastBtn" class="btn btn-orange" onclick="dBroadcast()">⚡ Yayınla</button>
               <button class="btn btn-ghost" onclick="dCopyTxHex()">⎘ Hex Kopyala</button>
             </div>
             <div id="dmusig2BroadcastResult" class="broadcast-result"></div>
@@ -600,7 +825,83 @@
 
   <div id="toast" class="toast"></div>
 
-  <script src="/static/musig2d.js?v=20260330"></script>
-  <script src="/static/app.js?v=20260330"></script>
+  <!-- 2B: Para Üstü Hızlı Session Modal -->
+  <div id="quickSessionModal" class="modal-overlay">
+    <div class="modal modal-lg">
+      <div class="modal-header">
+        <h3>⚡ Para Üstüyle Yeni İşlem</h3>
+        <button class="modal-close" onclick="closeModal('quickSessionModal')">×</button>
+      </div>
+
+      <div style="margin-bottom:16px">
+        <label class="form-label">Katılımcılar (önceki session'dan)</label>
+        <div id="qsParticipants" style="
+          background:var(--bg-3);
+          border:1px solid var(--border);
+          border-radius:var(--radius);
+          padding:10px 14px;
+        "></div>
+      </div>
+
+      <div style="margin-bottom:16px">
+        <label class="form-label">Kaynak İşlem</label>
+        <div style="display:flex;align-items:center;gap:8px">
+          <span id="qsSourceTxid" class="mono-xs" style="color:var(--text-3)"></span>
+          <a id="qsSourceExplorer" class="btn btn-ghost sm" href="#" target="_blank" style="padding:2px 8px">↗</a>
+        </div>
+      </div>
+
+      <div style="
+        background:var(--green-dim);
+        border:1px solid var(--green);
+        border-radius:var(--radius);
+        padding:8px 14px;
+        margin-bottom:16px;
+        font-size:13px;
+      ">
+        💰 Kullanılabilir:
+        <strong id="qsAvailableBalance" style="color:var(--green);margin-left:4px"></strong>
+      </div>
+
+      <div style="height:1px;background:var(--border);margin-bottom:16px"></div>
+
+      <div class="form-group">
+        <label class="form-label">Hedef Adres *</label>
+        <input id="qsToAddr" class="form-input" type="text" placeholder="tb1p...">
+      </div>
+
+      <div class="form-grid">
+        <div class="form-group">
+          <label class="form-label">Tutar (sat) *</label>
+          <div style="display:flex;gap:6px">
+            <input id="qsAmount" class="form-input" type="number" placeholder="0" style="flex:1">
+            <button class="btn btn-ghost sm" onclick="dQuickSessionFillMax()">Max</button>
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Ağ Ücreti (sat)</label>
+          <input id="qsFee" class="form-input" type="number" value="500">
+        </div>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">Açıklama</label>
+        <input id="qsDescription" class="form-input" type="text" placeholder="İsteğe bağlı">
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">Session Etiketi</label>
+        <input id="qsLabel" class="form-input" type="text">
+      </div>
+
+      <div class="modal-footer">
+        <button class="btn btn-ghost" onclick="closeModal('quickSessionModal')">Vazgeç</button>
+        <button class="btn btn-primary" onclick="dQuickSessionCreate()">⚡ Oluştur &amp; Başlat</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/musig2d.js?v=20260402"></script>
+  <script src="/static/app.js?v=20260402"></script>
 </body>
 </html>
