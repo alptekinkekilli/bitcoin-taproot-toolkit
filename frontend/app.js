@@ -13,7 +13,8 @@ let state = {
   hdPanelOpen: {},        // walletId → bool (panel açık mı?)
   txLastScan: {},         // address → ISO timestamp
   musig2Sessions: [],
-  dmusig2Sessions: [],    // dağıtık MuSig2 session listesi (TX dropdown için)
+  dmusig2Sessions: [],    // dağıtık MuSig2 aktif session listesi (dashboard/dropdown için)
+  dmusig2SessionsAll: [], // tüm dMusig2 session'ları (arşiv dahil — TX geçmişi için)
   activeMusig2Session: null,
   autoRefresh: true,
   dmusig2Session: null,
@@ -136,8 +137,9 @@ async function loadAll() {
   await loadWallets();
   refreshDashboard();
   loadMusig2();
-  // dMusig2 aktif session'larını yükle (TX dropdown için — BROADCAST/SIGNED hariç)
+  // dMusig2 session'larını yükle
   get('/api/musig2d/list').then(all => {
+    state.dmusig2SessionsAll = all;  // TX geçmişi için tümü
     state.dmusig2Sessions = all.filter(s => s.state !== 'BROADCAST' && s.state !== 'SIGNED');
     populateWalletSelects();
   }).catch(() => {});
@@ -547,7 +549,7 @@ function _explorerUrlFor(entry) {
     return s?.network === 'mainnet' ? 'https://mempool.space' : 'https://mempool.space/testnet4';
   }
   if (entry?.navType === 'dmusig2') {
-    const s = state.dmusig2Sessions.find(x => x.id === entry.navId);
+    const s = state.dmusig2SessionsAll.find(x => x.id === entry.navId);
     return s?.network === 'mainnet' ? 'https://mempool.space' : 'https://mempool.space/testnet4';
   }
   return 'https://mempool.space/testnet4';
@@ -571,7 +573,8 @@ function _txAddressesFor(filterAddr) {
     });
     state.musig2Sessions.filter(s => s.agg_address).forEach(s =>
       out.push({ addr: s.agg_address, label: s.label, navType: 'musig2', navId: s.id }));
-    state.dmusig2Sessions.filter(s => s.agg_address).forEach(s =>
+    // Arşiv dahil tüm dMusig2 session'ları tara
+    state.dmusig2SessionsAll.filter(s => s.agg_address).forEach(s =>
       out.push({ addr: s.agg_address, label: s.label, navType: 'dmusig2', navId: s.id }));
     return out;
   }
@@ -592,7 +595,7 @@ function _txAddressesFor(filterAddr) {
     if (s.agg_address === filterAddr)
       return [{ addr: filterAddr, label: s.label, navType: 'musig2', navId: s.id }];
   }
-  for (const s of state.dmusig2Sessions) {
+  for (const s of state.dmusig2SessionsAll) {
     if (s.agg_address === filterAddr)
       return [{ addr: filterAddr, label: s.label, navType: 'dmusig2', navId: s.id }];
   }
@@ -618,7 +621,7 @@ async function _renderTxUtxoPanel(filterAddr) {
     const totalSat = utxos.reduce((s, u) => s + (u.value || 0), 0);
     // Adres türüne göre aksiyon butonu
     const m2  = state.musig2Sessions.find(s => s.agg_address === filterAddr);
-    const dm2 = state.dmusig2Sessions.find(s => s.agg_address === filterAddr);
+    const dm2 = state.dmusig2SessionsAll.find(s => s.agg_address === filterAddr);
     const actionBtn = dm2
       ? `<button class="btn btn-ghost sm" style="margin-left:12px" onclick="dOpenSession('${dm2.id}')">⛓ Dağıtık MuSig2 oturumuna git →</button>`
       : m2
@@ -662,7 +665,7 @@ function _showScanSinceIfNeeded(filterAddr) {
   const el = document.getElementById('txScanSinceRow');
   if (!el) return;
   // MuSig2 adresi ise scan_since gösterme
-  const isMusig = [...state.musig2Sessions, ...state.dmusig2Sessions].some(s => s.agg_address === filterAddr);
+  const isMusig = [...state.musig2Sessions, ...state.dmusig2SessionsAll].some(s => s.agg_address === filterAddr);
   if (isMusig) { el.style.display = 'none'; return; }
   const w = state.wallets.find(x => x.address === filterAddr ||
     (state.hdScanResults[x.id]?.addresses || []).some(a => a.address === filterAddr));
@@ -1145,12 +1148,13 @@ function populateWalletSelects() {
         });
         opts += '</optgroup>';
       }
-      // Dağıtık MuSig2
-      const dm2 = state.dmusig2Sessions.filter(s => s.agg_address);
+      // Dağıtık MuSig2 — arşiv dahil tümü (TX geçmişi için)
+      const dm2 = state.dmusig2SessionsAll.filter(s => s.agg_address);
       if (dm2.length) {
         opts += '<optgroup label="── Dağıtık MuSig2">';
         dm2.forEach(s => {
-          opts += `<option value="${s.agg_address}" data-type="dmusig2" data-id="${s.id}">${s.label} — ${s.agg_address.substring(0, 16)}…</option>`;
+          const stateTag = (s.state === 'BROADCAST' || s.state === 'SIGNED') ? ' ✓' : '';
+          opts += `<option value="${s.agg_address}" data-type="dmusig2" data-id="${s.id}">${s.label}${stateTag} — ${s.agg_address.substring(0, 16)}…</option>`;
         });
         opts += '</optgroup>';
       }
@@ -1983,6 +1987,7 @@ async function dLoadSessionList() {
 
     // TX dropdown için state'i güncelle
     state.dmusig2Sessions = active;
+    state.dmusig2SessionsAll = sessions;
     populateWalletSelects();
 
     if (!active.length) {
