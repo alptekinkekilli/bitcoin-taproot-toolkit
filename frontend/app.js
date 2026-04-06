@@ -9,13 +9,16 @@ let state = {
   wallets: [],
   balances: {},
   txs: {},
+  hdScanResults: {},      // walletId → { addresses, total_balance_sat, scanned }
+  hdPanelOpen: {},        // walletId → bool (panel açık mı?)
+  txLastScan: {},         // address → ISO timestamp
   musig2Sessions: [],
   activeMusig2Session: null,
   autoRefresh: true,
-  dmusig2Session: null,   // aktif dağıtık MuSig2 oturumu
-  myPubkey: null,         // Phase 1: oturumdaki kendi pubkey'im
-  myIndex:  null,         // Phase 1: oturumdaki katılımcı indexim
-  myRole:   null,         // Phase 1: 'coordinator' | 'participant' | null
+  dmusig2Session: null,
+  myPubkey: null,
+  myIndex:  null,
+  myRole:   null,
   archiveSessions: [],
   archiveFiltered: [],
   archivePage: 1,
@@ -54,7 +57,11 @@ function showTab(name) {
   document.querySelector(`[data-tab="${name}"]`).classList.add('active');
 
   if (name === 'dashboard') refreshDashboard();
-  if (name === 'transactions') loadTxHistory();
+  if (name === 'transactions') {
+    const filterAddr = document.getElementById('txFilterWallet')?.value || '';
+    _showScanSinceIfNeeded(filterAddr);
+    loadTxHistory();
+  }
   if (name === 'musig2') loadMusig2();
   if (name === 'musig2d') {
     // Detay paneli açık kalmışsa temizle
@@ -132,6 +139,19 @@ async function loadAll() {
 
 async function loadWallets() {
   state.wallets = await get('/api/wallet/list').catch(() => []);
+  // G1/G2: backend'deki hd_addresses'i state.hdScanResults'a yükle
+  state.wallets.forEach(w => {
+    if (w.hd_addresses && Object.keys(w.hd_addresses).length) {
+      const addrs = Object.values(w.hd_addresses);
+      if (!state.hdScanResults[w.id]) {
+        state.hdScanResults[w.id] = {
+          addresses: addrs.map(a => ({ ...a })),
+          total_balance_sat: addrs.reduce((s, a) => s + (a.balance_sat || 0), 0),
+          scanned: addrs.length,
+        };
+      }
+    }
+  });
   renderWalletsTable();
   populateWalletSelects();
 }
@@ -145,8 +165,7 @@ function refreshAll() {
 // ── Dashboard ─────────────────────────────────────────────────────────────────
 
 async function refreshDashboard() {
-  document.getElementById('walletCount').textContent = state.wallets.length;
-
+  // 2B: Tüm birincil adreslerin bakiyesini çek
   const balFetches = state.wallets.map(async w => {
     try {
       const b = await get(`/api/wallet/${w.address}/balance`);
@@ -155,42 +174,135 @@ async function refreshDashboard() {
     } catch { return null; }
   });
 
-  const results = await Promise.all(balFetches);
-  const valid = results.filter(Boolean);
+  // HD alt adresler için de bakiye çek (state.hdScanResults'ta kayıtlı olanlar)
+  const hdFetches = [];
+  state.wallets.forEach(w => {
+    const scan = state.hdScanResults[w.id];
+    if (!scan) return;
+    scan.addresses.forEach(a => {
+      if (!a.address || a.address === w.address) return;
+      hdFetches.push(get(`/api/wallet/${a.address}/balance`).then(b => {
+        state.balances[a.address] = b;
+        a.balance_sat = b.total_sat;
+        a.utxo_count  = b.utxo_count;
+      }).catch(() => {}));
+    });
+  });
 
-  const totalSat   = valid.reduce((s, b) => s + b.total_sat, 0);
-  const confirmedSat  = valid.reduce((s, b) => s + b.confirmed_sat, 0);
-  const unconfirmedSat = valid.reduce((s, b) => s + b.unconfirmed_sat, 0);
+  await Promise.all([...balFetches, ...hdFetches]);
 
-  document.getElementById('totalBalance').textContent = `${totalSat.toLocaleString()} sat`;
+  // 2B: Toplam = birincil + HD alt adresleri
+  let totalSat = 0, confirmedSat = 0, unconfirmedSat = 0;
+  state.wallets.forEach(w => {
+    const b = state.balances[w.address];
+    if (b) { totalSat += b.total_sat; confirmedSat += b.confirmed_sat; unconfirmedSat += b.unconfirmed_sat; }
+    const scan = state.hdScanResults[w.id];
+    if (scan) {
+      scan.addresses.forEach(a => {
+        if (a.address === w.address) return;
+        const hb = state.balances[a.address];
+        if (hb) { totalSat += hb.total_sat; confirmedSat += hb.confirmed_sat; unconfirmedSat += hb.unconfirmed_sat; }
+      });
+    }
+  });
+
+  document.getElementById('totalBalance').textContent    = `${totalSat.toLocaleString()} sat`;
   document.getElementById('totalBalanceBtc').textContent = `${(totalSat / 1e8).toFixed(8)} BTC`;
-  document.getElementById('confirmedBalance').textContent = `${confirmedSat.toLocaleString()} sat`;
+  document.getElementById('confirmedBalance').textContent   = `${confirmedSat.toLocaleString()} sat`;
   document.getElementById('unconfirmedBalance').textContent = `${unconfirmedSat.toLocaleString()} sat`;
 
-  // Wallet table
+  // 2C: Cüzdan Sayısı kutusu — "N cüzdan / K aktif adres"
+  const activeAddrCount = (() => {
+    const seen = new Set();
+    state.wallets.forEach(w => {
+      const b = state.balances[w.address];
+      if (b && b.total_sat > 0) seen.add(w.address);
+      const scan = state.hdScanResults[w.id];
+      if (scan) scan.addresses.forEach(a => {
+        if (a.balance_sat > 0) seen.add(a.address);
+      });
+    });
+    return seen.size;
+  })();
+  document.getElementById('walletCount').textContent = state.wallets.length;
+  const walletSubEl = document.getElementById('walletCountSub');
+  if (walletSubEl) walletSubEl.textContent = activeAddrCount ? `${activeAddrCount} aktif adres` : '';
+
+  // 2A: Adresler tablosu — birincil + HD alt satırları
+  _renderDashboardAddressTable();
+
+  await loadRecentTxs();
+}
+
+function _renderDashboardAddressTable() {
   const tbody = document.getElementById('dashboardWalletTable');
   if (!state.wallets.length) {
     tbody.innerHTML = '<tr><td colspan="5" class="empty">Cüzdan yok — Cüzdanlar sekmesinden ekleyin</td></tr>';
-  } else {
-    tbody.innerHTML = state.wallets.map(w => {
-      const b = state.balances[w.address];
-      const satDisplay = b ? `${b.total_sat.toLocaleString()} sat` : '…';
-      const utxoDisplay = b ? b.utxo_count : '—';
-      return `<tr>
-        <td><span class="bold">${w.label}</span></td>
-        <td><span class="mono truncate">${w.address}</span></td>
-        <td><span class="orange bold">${satDisplay}</span></td>
-        <td>${utxoDisplay}</td>
-        <td>
-          <button class="btn btn-ghost sm" onclick="quickReceive('${w.address}')">Al</button>
-          <button class="btn btn-ghost sm" onclick="quickSend('${w.address}')">Gönder</button>
-        </td>
-      </tr>`;
-    }).join('');
+    return;
   }
 
-  // Recent txs
-  await loadRecentTxs();
+  let rows = '';
+  state.wallets.forEach(w => {
+    const b = state.balances[w.address];
+    const satDisplay  = b ? `${b.total_sat.toLocaleString()} sat` : '…';
+    const utxoDisplay = b ? b.utxo_count : '—';
+    const scan = state.hdScanResults[w.id];
+    const hasHD = scan && scan.addresses.some(a => a.address !== w.address && (a.balance_sat > 0 || a.utxo_count > 0));
+    const toggleBtn = hasHD
+      ? `<button class="btn btn-ghost sm" onclick="_toggleDashHD('${w.id}')" id="dash-hd-toggle-${w.id}" title="HD alt adresleri göster">▶</button>`
+      : '';
+
+    rows += `<tr>
+      <td><span class="bold">${w.label}</span>${w.hd_imported ? ' <span class="badge badge-yellow" style="font-size:9px">import</span>' : ''}${toggleBtn}</td>
+      <td><span class="mono-xs truncate" style="max-width:220px;display:inline-block">${w.address}</span></td>
+      <td><span class="orange bold">${satDisplay}</span></td>
+      <td>${utxoDisplay}</td>
+      <td>
+        <button class="btn btn-ghost sm" onclick="quickReceive('${w.address}')">Al</button>
+        <button class="btn btn-ghost sm" onclick="quickSend('${w.address}')">Gönder</button>
+      </td>
+    </tr>`;
+
+    // 2A: HD alt adres satırları (toggle ile açılıp kapanır)
+    if (hasHD) {
+      const open = state.hdPanelOpen[`dash-${w.id}`];
+      const activeHD = scan.addresses.filter(a => a.address !== w.address && (a.balance_sat > 0 || a.utxo_count > 0));
+      rows += `<tr id="dash-hd-rows-${w.id}" style="display:${open ? '' : 'none'}">
+        <td colspan="5" style="padding:0">
+          <table class="data-table" style="font-size:12px;background:var(--bg-2)">
+            <tbody>
+              ${activeHD.map(a => {
+                const hb = state.balances[a.address];
+                const hSat  = hb ? hb.total_sat.toLocaleString() : (a.balance_sat || 0).toLocaleString();
+                const hUtxo = hb ? hb.utxo_count : (a.utxo_count || 0);
+                return `<tr style="border-left:3px solid var(--orange)">
+                  <td style="padding-left:24px;color:var(--text-3)">${w.label} [${a.index ?? '?'}]</td>
+                  <td><span class="mono-xs" style="word-break:break-all">${a.address}</span></td>
+                  <td><span class="orange bold">${hSat} sat</span></td>
+                  <td>${hUtxo}</td>
+                  <td>
+                    <button class="btn btn-ghost sm" onclick="quickReceive('${a.address}')">Al</button>
+                    <button class="btn btn-ghost sm" onclick="quickSend('${a.address}')">Gönder</button>
+                  </td>
+                </tr>`;
+              }).join('')}
+            </tbody>
+          </table>
+        </td>
+      </tr>`;
+    }
+  });
+
+  tbody.innerHTML = rows;
+}
+
+function _toggleDashHD(walletId) {
+  const key = `dash-${walletId}`;
+  state.hdPanelOpen[key] = !state.hdPanelOpen[key];
+  const row = document.getElementById(`dash-hd-rows-${walletId}`);
+  const btn = document.getElementById(`dash-hd-toggle-${walletId}`);
+  if (row) row.style.display = state.hdPanelOpen[key] ? '' : 'none';
+  if (btn) btn.textContent = state.hdPanelOpen[key] ? '▼' : '▶';
 }
 
 async function loadRecentTxs() {
@@ -337,37 +449,45 @@ function copyTxHex() {
 
 async function loadTxHistory() {
   const filterAddr = document.getElementById('txFilterWallet').value;
+
+  // 3A: UTXO panelini güncelle
+  await _renderTxUtxoPanel(filterAddr);
+
   const tbody = document.getElementById('txHistoryTable');
   tbody.innerHTML = '<tr><td colspan="6" class="empty">Yükleniyor…</td></tr>';
 
-  let allTxs = [];
-  const targets = filterAddr
-    ? state.wallets.filter(w => w.address === filterAddr)
-    : state.wallets;
+  // 3E: Seçili adres doğrudan bir HD alt adresi mi?
+  const allAddresses = _txAddressesFor(filterAddr);
 
-  for (const w of targets) {
+  let allTxs = [];
+  for (const { addr, label } of allAddresses) {
     try {
-      const txs = await get(`/api/wallet/${w.address}/txs`);
-      allTxs = allTxs.concat(txs.map(t => ({ ...t, _wallet: w.label, _addr: w.address })));
+      const txs = await get(`/api/wallet/${addr}/txs`);
+      state.txLastScan[addr] = new Date().toLocaleTimeString('tr-TR');
+      allTxs = allTxs.concat(txs.map(t => ({ ...t, _wallet: label, _addr: addr })));
     } catch {}
   }
 
+  // Son tarama zamanını güncelle
+  _updateTxScanTime(filterAddr);
+
   allTxs.sort((a, b) => (b.status?.block_time || 0) - (a.status?.block_time || 0));
+
+  // Tekrar eden TXID'leri birleştir
+  const seen = new Set();
+  allTxs = allTxs.filter(tx => { if (seen.has(tx.txid)) return false; seen.add(tx.txid); return true; });
 
   if (!allTxs.length) {
     tbody.innerHTML = '<tr><td colspan="6" class="empty">İşlem bulunamadı</td></tr>';
     return;
   }
 
+  const explorerBase = _explorerBase(filterAddr);
   tbody.innerHTML = allTxs.map(tx => {
-    const date = tx.status?.block_time
-      ? new Date(tx.status.block_time * 1000).toLocaleString('tr-TR')
-      : '—';
+    const date  = tx.status?.block_time
+      ? new Date(tx.status.block_time * 1000).toLocaleString('tr-TR') : '—';
     const block = tx.status?.block_height ? `#${tx.status.block_height}` : 'Mempool';
-
-    // Basit tutar hesabı
     const outSum = tx.vout?.reduce((s, o) => s + o.value, 0) || 0;
-
     return `<tr>
       <td><span class="mono-xs truncate" style="max-width:180px;display:inline-block">${tx.txid}</span></td>
       <td class="muted" style="font-size:11px">${date}</td>
@@ -375,10 +495,125 @@ async function loadTxHistory() {
       <td><span class="orange mono-sm">${outSum.toLocaleString()} sat</span></td>
       <td>${statusBadge(tx.status?.confirmed)}</td>
       <td>
-        <a class="link" href="https://mempool.space/testnet4/tx/${tx.txid}" target="_blank" title="Explorer'da Aç">↗</a>
+        <a class="link" href="${explorerBase}/tx/${tx.txid}" target="_blank" title="Explorer'da Aç">↗</a>
       </td>
     </tr>`;
   }).join('');
+}
+
+// Seçili adrese göre taranacak adresleri döner {addr, label}[]
+function _txAddressesFor(filterAddr) {
+  if (!filterAddr) {
+    // Tüm cüzdanlar: birincil + HD alt
+    const out = [];
+    state.wallets.forEach(w => {
+      out.push({ addr: w.address, label: w.label });
+      const scan = state.hdScanResults[w.id];
+      if (scan) scan.addresses.forEach(a => {
+        if (a.address !== w.address) out.push({ addr: a.address, label: `${w.label} [${a.index ?? '?'}]` });
+      });
+    });
+    return out;
+  }
+  // Tek adres — hangi cüzdana ait?
+  for (const w of state.wallets) {
+    if (w.address === filterAddr) return [{ addr: filterAddr, label: w.label }];
+    const scan = state.hdScanResults[w.id];
+    if (scan) {
+      const found = scan.addresses.find(a => a.address === filterAddr);
+      if (found) return [{ addr: filterAddr, label: `${w.label} [${found.index ?? '?'}]` }];
+    }
+  }
+  return [{ addr: filterAddr, label: filterAddr.substring(0, 12) + '…' }];
+}
+
+// 3A: UTXO paneli
+async function _renderTxUtxoPanel(filterAddr) {
+  const panel = document.getElementById('txUtxoPanel');
+  if (!panel) return;
+  if (!filterAddr) { panel.style.display = 'none'; return; }
+
+  panel.style.display = '';
+  panel.innerHTML = '<div style="color:var(--text-3);font-size:12px;padding:6px 0">UTXO yükleniyor…</div>';
+
+  try {
+    const res = await fetch(`/api/wallet/${filterAddr}/utxos`);
+    const utxos = await res.json();
+    if (!Array.isArray(utxos) || !utxos.length) {
+      panel.innerHTML = '<div style="color:var(--text-3);font-size:12px;padding:6px 0">Bu adrese ait UTXO yok.</div>';
+      return;
+    }
+    const totalSat = utxos.reduce((s, u) => s + (u.value || 0), 0);
+    panel.innerHTML = `
+      <div style="font-size:12px;color:var(--text-2);margin-bottom:8px">
+        <strong>${utxos.length} UTXO</strong> &mdash; Toplam: <strong style="color:var(--orange)">${totalSat.toLocaleString()} sat</strong>
+        <button class="btn btn-ghost sm" style="margin-left:12px" onclick="quickSend('${filterAddr}')">Bu adresten gönder →</button>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table" style="font-size:12px">
+          <thead><tr><th>TXID:vout</th><th>Tutar</th><th>Onay</th></tr></thead>
+          <tbody>
+            ${utxos.map(u => `<tr>
+              <td><span class="mono-xs">${u.txid ? u.txid.substring(0,16) + '…:' + u.vout : '—'}</span></td>
+              <td><span class="orange">${(u.value || 0).toLocaleString()} sat</span></td>
+              <td>${u.confirmations >= 1 ? `<span class="badge badge-green">${u.confirmations}</span>` : '<span class="badge badge-yellow">0</span>'}</td>
+            </tr>`).join('')}
+          </tbody>
+        </table>
+      </div>`;
+  } catch {
+    panel.innerHTML = '<div style="color:#f85149;font-size:12px">UTXO yüklenemedi.</div>';
+  }
+}
+
+function _updateTxScanTime(filterAddr) {
+  const el = document.getElementById('txLastScanTime');
+  if (!el) return;
+  if (filterAddr && state.txLastScan[filterAddr]) {
+    el.textContent = `Son tarama: ${state.txLastScan[filterAddr]}`;
+  } else {
+    const times = Object.values(state.txLastScan);
+    el.textContent = times.length ? `Son tarama: ${times[times.length - 1]}` : '';
+  }
+}
+
+function _explorerBase(filterAddr) {
+  if (!filterAddr) return 'https://mempool.space/testnet4';
+  for (const w of state.wallets) {
+    if (w.address === filterAddr || (state.hdScanResults[w.id]?.addresses || []).some(a => a.address === filterAddr)) {
+      return w.network === 'mainnet' ? 'https://mempool.space' : 'https://mempool.space/testnet4';
+    }
+  }
+  return 'https://mempool.space/testnet4';
+}
+
+// 3C: İmport edilmiş cüzdan için scan_since
+function _showScanSinceIfNeeded(filterAddr) {
+  const el = document.getElementById('txScanSinceRow');
+  if (!el) return;
+  const w = state.wallets.find(x => x.address === filterAddr ||
+    (state.hdScanResults[x.id]?.addresses || []).some(a => a.address === filterAddr));
+  el.style.display = (w && w.hd_imported) ? '' : 'none';
+  if (w && w.hd_imported && w.scan_since) {
+    const el2 = document.getElementById('txScanSinceInput');
+    if (el2 && !el2.value) el2.value = new Date(w.scan_since * 1000).toISOString().slice(0, 10);
+  }
+}
+
+async function saveScanSince() {
+  const filterAddr = document.getElementById('txFilterWallet').value;
+  const dateVal    = document.getElementById('txScanSinceInput').value;
+  if (!filterAddr || !dateVal) return;
+  const ts = Math.floor(new Date(dateVal).getTime() / 1000);
+  const w  = state.wallets.find(x => x.address === filterAddr);
+  if (!w) return;
+  try {
+    await post(`/api/wallet/${w.id}/scan-since`, { since: ts });
+    toast('Tarama tarihi kaydedildi', 'success');
+    loadTxHistory();
+  } catch(e) {
+    toast(e.message, 'error');
+  }
 }
 
 // ── MuSig2 ────────────────────────────────────────────────────────────────────
@@ -607,6 +842,8 @@ function renderWalletsTable() {
     const scanBtn = isHD
       ? `<button class="btn btn-ghost sm" onclick="hdScanWallet('${w.id}')" title="HD adreslerini tara">⟳ HD Tara</button>`
       : '';
+    // 1B: panel daha önce açıksa açık gelsin
+    const panelOpen = !!state.hdPanelOpen[`wallets-${w.id}`];
     return `
     <tr id="wallet-row-${w.id}">
       <td><span class="bold">${w.label}</span>${w.hd_imported ? ' <span class="badge badge-yellow" style="font-size:9px">import</span>' : ''}</td>
@@ -623,68 +860,81 @@ function renderWalletsTable() {
         <button class="btn btn-danger sm" onclick="removeWallet('${w.address}')">Sil</button>
       </td>
     </tr>
-    <tr id="wallet-hd-panel-${w.id}" style="display:none">
+    <tr id="wallet-hd-panel-${w.id}" style="display:${panelOpen ? '' : 'none'}">
       <td colspan="5" style="padding:0">
-        <div id="wallet-hd-body-${w.id}" style="padding:12px 16px;background:var(--bg-2);border-top:1px solid var(--border)"></div>
+        <div id="wallet-hd-body-${w.id}" style="padding:12px 16px;background:var(--bg-2);border-top:1px solid var(--border)">
+          ${panelOpen && state.hdScanResults[w.id] ? _renderHDBody(w.id) : ''}
+        </div>
       </td>
     </tr>`;
   }).join('');
 }
 
+function _renderHDBody(walletId) {
+  const res = state.hdScanResults[walletId];
+  if (!res) return '';
+  const addrs = res.addresses.filter(a => a.balance_sat > 0 || a.utxo_count > 0);
+  if (!addrs.length) return '<div style="color:var(--text-3);font-size:13px;padding:8px 0">Bakiye bulunan adres yok.</div>';
+  return `
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+      <span style="font-size:13px;color:var(--text-2)">${res.scanned} adres tarandı &mdash;
+        <strong style="color:var(--orange)">${addrs.length} aktif</strong>,
+        toplam <strong>${(res.total_balance_sat / 1e8).toFixed(8)} BTC</strong></span>
+      <button class="btn btn-ghost sm" onclick="hdScanWallet('${walletId}')">↺ Yenile</button>
+    </div>
+    <div class="table-wrap">
+      <table class="data-table" style="font-size:12px">
+        <thead><tr><th>İndis</th><th>Adres</th><th>Bakiye</th><th>UTXO</th><th></th></tr></thead>
+        <tbody>
+          ${addrs.map(a => `
+            <tr>
+              <td style="color:var(--text-3)">${a.index ?? '?'}</td>
+              <td><span class="mono-xs" style="word-break:break-all">${a.address}</span></td>
+              <td><strong style="color:var(--orange)">${(a.balance_sat / 1e8).toFixed(8)} BTC</strong></td>
+              <td>${a.utxo_count}</td>
+              <td>
+                <button class="btn btn-ghost sm" onclick="copyText('${a.address}')">⎘</button>
+                <button class="btn btn-ghost sm" onclick="quickSend('${a.address}')">Gönder</button>
+              </td>
+            </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>`;
+}
+
 // ── HD Cüzdan Tarama ──────────────────────────────────────────────────────────
 
 async function hdScanWallet(walletId) {
-  const panel  = document.getElementById(`wallet-hd-panel-${walletId}`);
-  const body   = document.getElementById(`wallet-hd-body-${walletId}`);
-  if (!panel || !body) return;
+  const panel = document.getElementById(`wallet-hd-panel-${walletId}`);
+  const body  = document.getElementById(`wallet-hd-body-${walletId}`);
+  const key   = `wallets-${walletId}`;
 
-  // Toggle: zaten açıksa kapat
-  if (panel.style.display !== 'none') {
-    panel.style.display = 'none';
-    return;
+  // Toggle: zaten açık ve veri varsa kapat
+  if (panel && panel.style.display !== 'none' && state.hdScanResults[walletId]) {
+    // Yenile butonundan çağrıldıysa devam et, toggle değil
+    const isCalled = arguments[1] === 'refresh';
+    if (!isCalled) {
+      state.hdPanelOpen[key] = false;
+      panel.style.display = 'none';
+      return;
+    }
   }
 
-  panel.style.display = '';
-  body.innerHTML = '<div style="color:var(--text-3);font-size:13px;padding:8px 0">Adresler taranıyor (0–50)… lütfen bekleyin.</div>';
+  // Panel'i aç
+  state.hdPanelOpen[key] = true;
+  if (panel) panel.style.display = '';
+  if (body)  body.innerHTML = '<div style="color:var(--text-3);font-size:13px;padding:8px 0">Adresler taranıyor… lütfen bekleyin.</div>';
 
   try {
     const res = await post(`/api/wallet/${walletId}/hd-scan`, {});
-    const addrs = res.addresses.filter(a => a.balance_sat > 0 || a.utxo_count > 0);
-
-    if (!addrs.length) {
-      body.innerHTML = '<div style="color:var(--text-3);font-size:13px;padding:8px 0">Bakiye bulunan adres yok (gap_limit=20 tarandı).</div>';
-      return;
-    }
-
-    const totalSat = res.total_balance_sat;
-    body.innerHTML = `
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
-        <span style="font-size:13px;color:var(--text-2)">${res.scanned} adres tarandı &mdash; <strong style="color:var(--orange)">${addrs.length} aktif</strong>, toplam <strong>${(totalSat/1e8).toFixed(8)} BTC</strong></span>
-        <button class="btn btn-ghost sm" onclick="document.getElementById('wallet-hd-panel-${walletId}').style.display='none'">Kapat</button>
-      </div>
-      <div class="table-wrap">
-        <table class="data-table" style="font-size:12px">
-          <thead><tr><th>İndis</th><th>Adres</th><th>Bakiye</th><th>UTXO</th><th></th></tr></thead>
-          <tbody>
-            ${addrs.map(a => `
-              <tr>
-                <td style="color:var(--text-3)">${a.index}</td>
-                <td><span class="mono-xs" style="word-break:break-all">${a.address}</span></td>
-                <td><strong style="color:var(--orange)">${(a.balance_sat/1e8).toFixed(8)} BTC</strong></td>
-                <td>${a.utxo_count}</td>
-                <td>
-                  <button class="btn btn-ghost sm" onclick="copyText('${a.address}')">⎘</button>
-                  <button class="btn btn-ghost sm" onclick="quickSend('${a.address}')">Gönder</button>
-                </td>
-              </tr>`).join('')}
-          </tbody>
-        </table>
-      </div>`;
-
-    // Wallet select dropdown'larını da güncelle (Gönder formu için)
+    // 1A: Sonucu state'e kaydet
+    state.hdScanResults[walletId] = res;
+    if (body) body.innerHTML = _renderHDBody(walletId);
     populateWalletSelects();
+    // Dashboard'u da güncelle (bakiyeler değişmiş olabilir)
+    _renderDashboardAddressTable();
   } catch(e) {
-    body.innerHTML = `<div style="color:#f85149;font-size:13px">Tarama hatası: ${e.message}</div>`;
+    if (body) body.innerHTML = `<div style="color:#f85149;font-size:13px">Tarama hatası: ${e.message}</div>`;
   }
 }
 
@@ -829,14 +1079,16 @@ function copyToClipboard(text) {
   if (navigator.clipboard && navigator.clipboard.writeText) {
     return navigator.clipboard.writeText(text);
   }
-  // HTTP (non-localhost) fallback
-  const el = document.createElement('textarea');
-  el.value = text;
-  el.style.cssText = 'position:fixed;top:-9999px;left:-9999px';
-  document.body.appendChild(el);
-  el.select();
-  document.execCommand('copy');
-  document.body.removeChild(el);
+  // HTTP (non-localhost) fallback: selection + clipboard write via input trick
+  const inp = document.createElement('input');
+  inp.value = text;
+  inp.style.cssText = 'position:fixed;opacity:0;top:0;left:0';
+  document.body.appendChild(inp);
+  inp.focus();
+  inp.select();
+  inp.setSelectionRange(0, text.length);
+  try { navigator.clipboard.writeText(text); } catch {}
+  document.body.removeChild(inp);
   return Promise.resolve();
 }
 

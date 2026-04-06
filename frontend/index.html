@@ -73,8 +73,9 @@
             <div class="stat-value" id="unconfirmedBalance">— sat</div>
           </div>
           <div class="stat-card">
-            <div class="stat-label">Cüzdan Sayısı</div>
+            <div class="stat-label">Cüzdan / Aktif Adres</div>
             <div class="stat-value" id="walletCount">—</div>
+            <div class="stat-sub" id="walletCountSub"></div>
           </div>
         </div>
         <div class="section-header">
@@ -173,12 +174,26 @@
         <div class="page-header">
           <h1>İşlemler</h1>
           <div class="header-actions">
-            <select class="form-select sm" id="txFilterWallet" onchange="loadTxHistory()">
+            <select class="form-select sm" id="txFilterWallet"
+              onchange="_showScanSinceIfNeeded(this.value); loadTxHistory()">
               <option value="">Tüm Cüzdanlar</option>
             </select>
-            <button class="btn btn-ghost" onclick="loadTxHistory()">↺</button>
+            <button class="btn btn-ghost" onclick="loadTxHistory()" title="Yenile">↺</button>
+            <span id="txLastScanTime" style="font-size:11px;color:var(--text-3);align-self:center"></span>
           </div>
         </div>
+
+        <!-- 3C: Import cüzdanı için tarama başlangıç tarihi -->
+        <div id="txScanSinceRow" style="display:none;margin-bottom:12px;display:flex;gap:8px;align-items:center">
+          <label style="font-size:12px;color:var(--text-3);white-space:nowrap">Tarama başlangıcı:</label>
+          <input type="date" id="txScanSinceInput" class="form-input" style="max-width:160px;padding:4px 8px;font-size:12px">
+          <button class="btn btn-ghost sm" onclick="saveScanSince()">Kaydet ve Tara</button>
+        </div>
+
+        <!-- 3A: UTXO Paneli -->
+        <div id="txUtxoPanel" style="display:none;margin-bottom:16px;padding:12px 16px;background:var(--bg-2);border:1px solid var(--border);border-radius:var(--radius-lg)"></div>
+
+        <!-- TX Listesi -->
         <div class="table-wrap">
           <table class="data-table">
             <thead><tr>
@@ -948,6 +963,6 @@
   </div>
 
   <script src="/static/musig2d.js?v=20260402"></script>
-  <script src="/static/app.js?v=20260406b"></script>
+  <script src="/static/app.js?v=20260407"></script>
 </body>
 </html>

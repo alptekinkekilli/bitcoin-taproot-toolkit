@@ -939,6 +939,20 @@ def export_wallet_bsms(label: str):
     )
 
 
+class ScanSinceRequest(BaseModel):
+    since: int  # Unix timestamp
+
+@app.post("/api/wallet/{wallet_id}/scan-since")
+def set_scan_since(wallet_id: str, req: ScanSinceRequest):
+    """Import edilmiş cüzdan için tarama başlangıç tarihini kaydet."""
+    w = next((x for x in wallets if x["id"] == wallet_id), None)
+    if not w:
+        raise HTTPException(404, "Cüzdan bulunamadı")
+    w["scan_since"] = req.since
+    _save_wallets()
+    return {"ok": True, "scan_since": req.since}
+
+
 @app.delete("/api/wallet/{address}")
 def delete_wallet(address: str):
     global wallets
