@@ -13,6 +13,7 @@ let state = {
   hdPanelOpen: {},        // walletId → bool (panel açık mı?)
   txLastScan: {},         // address → ISO timestamp
   musig2Sessions: [],
+  dmusig2Sessions: [],    // dağıtık MuSig2 session listesi (TX dropdown için)
   activeMusig2Session: null,
   autoRefresh: true,
   dmusig2Session: null,
@@ -135,6 +136,11 @@ async function loadAll() {
   await loadWallets();
   refreshDashboard();
   loadMusig2();
+  // dMusig2 aktif session'larını yükle (TX dropdown için — BROADCAST/SIGNED hariç)
+  get('/api/musig2d/list').then(all => {
+    state.dmusig2Sessions = all.filter(s => s.state !== 'BROADCAST' && s.state !== 'SIGNED');
+    populateWalletSelects();
+  }).catch(() => {});
 }
 
 async function loadWallets() {
@@ -450,81 +456,147 @@ function copyTxHex() {
 async function loadTxHistory() {
   const filterAddr = document.getElementById('txFilterWallet').value;
 
-  // 3A: UTXO panelini güncelle
+  // UTXO paneli
   await _renderTxUtxoPanel(filterAddr);
 
   const tbody = document.getElementById('txHistoryTable');
-  tbody.innerHTML = '<tr><td colspan="6" class="empty">Yükleniyor…</td></tr>';
+  tbody.innerHTML = '<tr><td colspan="7" class="empty">Yükleniyor…</td></tr>';
 
-  // 3E: Seçili adres doğrudan bir HD alt adresi mi?
   const allAddresses = _txAddressesFor(filterAddr);
 
   let allTxs = [];
-  for (const { addr, label } of allAddresses) {
+  for (const entry of allAddresses) {
     try {
-      const txs = await get(`/api/wallet/${addr}/txs`);
-      state.txLastScan[addr] = new Date().toLocaleTimeString('tr-TR');
-      allTxs = allTxs.concat(txs.map(t => ({ ...t, _wallet: label, _addr: addr })));
+      const txs = await get(`/api/wallet/${entry.addr}/txs`);
+      state.txLastScan[entry.addr] = new Date().toLocaleTimeString('tr-TR');
+      allTxs = allTxs.concat(txs.map(t => ({ ...t, _entry: entry })));
     } catch {}
   }
 
-  // Son tarama zamanını güncelle
   _updateTxScanTime(filterAddr);
 
   allTxs.sort((a, b) => (b.status?.block_time || 0) - (a.status?.block_time || 0));
 
-  // Tekrar eden TXID'leri birleştir
-  const seen = new Set();
-  allTxs = allTxs.filter(tx => { if (seen.has(tx.txid)) return false; seen.add(tx.txid); return true; });
+  // Tekrar eden TXID: birden fazla adrese gelen aynı TX — kaynakları birleştir
+  const txMap = new Map();
+  for (const tx of allTxs) {
+    if (txMap.has(tx.txid)) {
+      // Birden fazla kaynak adresi var — listeye ekle
+      txMap.get(tx.txid)._entries.push(tx._entry);
+    } else {
+      txMap.set(tx.txid, { ...tx, _entries: [tx._entry] });
+    }
+  }
+  const dedupedTxs = [...txMap.values()];
 
-  if (!allTxs.length) {
-    tbody.innerHTML = '<tr><td colspan="6" class="empty">İşlem bulunamadı</td></tr>';
+  if (!dedupedTxs.length) {
+    tbody.innerHTML = '<tr><td colspan="7" class="empty">İşlem bulunamadı</td></tr>';
     return;
   }
 
-  const explorerBase = _explorerBase(filterAddr);
-  tbody.innerHTML = allTxs.map(tx => {
+  tbody.innerHTML = dedupedTxs.map(tx => {
     const date  = tx.status?.block_time
       ? new Date(tx.status.block_time * 1000).toLocaleString('tr-TR') : '—';
     const block = tx.status?.block_height ? `#${tx.status.block_height}` : 'Mempool';
     const outSum = tx.vout?.reduce((s, o) => s + o.value, 0) || 0;
+    const explorerUrl = _explorerUrlFor(tx._entries[0]);
+
+    // Kaynak etiketi(ler) — tıklanabilir navigasyon linkleri
+    const sourceHtml = tx._entries.map(e => _txSourceLink(e)).join(' ');
+
     return `<tr>
-      <td><span class="mono-xs truncate" style="max-width:180px;display:inline-block">${tx.txid}</span></td>
+      <td><span class="mono-xs truncate" style="max-width:160px;display:inline-block">${tx.txid}</span></td>
       <td class="muted" style="font-size:11px">${date}</td>
       <td><span class="muted">${block}</span></td>
       <td><span class="orange mono-sm">${outSum.toLocaleString()} sat</span></td>
       <td>${statusBadge(tx.status?.confirmed)}</td>
-      <td>
-        <a class="link" href="${explorerBase}/tx/${tx.txid}" target="_blank" title="Explorer'da Aç">↗</a>
-      </td>
+      <td style="max-width:160px">${sourceHtml}</td>
+      <td><a class="link" href="${explorerUrl}" target="_blank" title="Explorer'da Aç">↗</a></td>
     </tr>`;
   }).join('');
 }
 
-// Seçili adrese göre taranacak adresleri döner {addr, label}[]
+// Kaynak linki: cüzdan → wallets tab, musig2 → session, dmusig2 → detay
+function _txSourceLink(entry) {
+  if (!entry) return '—';
+  const label = entry.label || '?';
+  if (entry.navType === 'wallet') {
+    return `<button class="btn btn-ghost sm" style="font-size:11px;padding:2px 6px"
+      onclick="showTab('wallets')" title="${entry.addr}">◻ ${label}</button>`;
+  }
+  if (entry.navType === 'musig2') {
+    return `<button class="btn btn-ghost sm" style="font-size:11px;padding:2px 6px"
+      onclick="showTab('musig2')" title="${entry.addr}">⊕ ${label}</button>`;
+  }
+  if (entry.navType === 'dmusig2') {
+    return `<button class="btn btn-ghost sm" style="font-size:11px;padding:2px 6px"
+      onclick="dOpenSession('${entry.navId}')" title="${entry.addr}">⛓ ${label}</button>`;
+  }
+  return `<span class="muted" style="font-size:11px">${label}</span>`;
+}
+
+function _explorerUrlFor(entry) {
+  // Cüzdanın veya session'ın ağına göre base URL
+  if (entry?.navType === 'wallet') {
+    const w = state.wallets.find(x => x.address === entry.navId);
+    const base = (w?.network === 'mainnet') ? 'https://mempool.space' : 'https://mempool.space/testnet4';
+    return base;
+  }
+  if (entry?.navType === 'musig2') {
+    const s = state.musig2Sessions.find(x => x.id === entry.navId);
+    return s?.network === 'mainnet' ? 'https://mempool.space' : 'https://mempool.space/testnet4';
+  }
+  if (entry?.navType === 'dmusig2') {
+    const s = state.dmusig2Sessions.find(x => x.id === entry.navId);
+    return s?.network === 'mainnet' ? 'https://mempool.space' : 'https://mempool.space/testnet4';
+  }
+  return 'https://mempool.space/testnet4';
+}
+
+// Seçili adrese göre taranacak adresleri döner
+// {addr, label, navType, navId}[]
+// navType: 'wallet' | 'musig2' | 'dmusig2' | null
+// navId  : navigasyon hedefi (wallet.address veya session.id)
 function _txAddressesFor(filterAddr) {
   if (!filterAddr) {
-    // Tüm cüzdanlar: birincil + HD alt
+    // Tüm: cüzdanlar + HD alt + aktif MuSig2 + dMusig2
     const out = [];
     state.wallets.forEach(w => {
-      out.push({ addr: w.address, label: w.label });
+      out.push({ addr: w.address, label: w.label, navType: 'wallet', navId: w.address });
       const scan = state.hdScanResults[w.id];
       if (scan) scan.addresses.forEach(a => {
-        if (a.address !== w.address) out.push({ addr: a.address, label: `${w.label} [${a.index ?? '?'}]` });
+        if (a.address !== w.address)
+          out.push({ addr: a.address, label: `${w.label} [${a.index ?? '?'}]`, navType: 'wallet', navId: w.address });
       });
     });
+    state.musig2Sessions.filter(s => s.agg_address).forEach(s =>
+      out.push({ addr: s.agg_address, label: s.label, navType: 'musig2', navId: s.id }));
+    state.dmusig2Sessions.filter(s => s.agg_address).forEach(s =>
+      out.push({ addr: s.agg_address, label: s.label, navType: 'dmusig2', navId: s.id }));
     return out;
   }
-  // Tek adres — hangi cüzdana ait?
+
+  // Tek adres — cüzdanlarda ara
   for (const w of state.wallets) {
-    if (w.address === filterAddr) return [{ addr: filterAddr, label: w.label }];
+    if (w.address === filterAddr)
+      return [{ addr: filterAddr, label: w.label, navType: 'wallet', navId: w.address }];
     const scan = state.hdScanResults[w.id];
     if (scan) {
       const found = scan.addresses.find(a => a.address === filterAddr);
-      if (found) return [{ addr: filterAddr, label: `${w.label} [${found.index ?? '?'}]` }];
+      if (found)
+        return [{ addr: filterAddr, label: `${w.label} [${found.index ?? '?'}]`, navType: 'wallet', navId: w.address }];
     }
   }
-  return [{ addr: filterAddr, label: filterAddr.substring(0, 12) + '…' }];
+  // MuSig2'de ara
+  for (const s of state.musig2Sessions) {
+    if (s.agg_address === filterAddr)
+      return [{ addr: filterAddr, label: s.label, navType: 'musig2', navId: s.id }];
+  }
+  for (const s of state.dmusig2Sessions) {
+    if (s.agg_address === filterAddr)
+      return [{ addr: filterAddr, label: s.label, navType: 'dmusig2', navId: s.id }];
+  }
+  return [{ addr: filterAddr, label: filterAddr.substring(0, 12) + '…', navType: null, navId: null }];
 }
 
 // 3A: UTXO paneli
@@ -544,10 +616,18 @@ async function _renderTxUtxoPanel(filterAddr) {
       return;
     }
     const totalSat = utxos.reduce((s, u) => s + (u.value || 0), 0);
+    // Adres türüne göre aksiyon butonu
+    const m2  = state.musig2Sessions.find(s => s.agg_address === filterAddr);
+    const dm2 = state.dmusig2Sessions.find(s => s.agg_address === filterAddr);
+    const actionBtn = dm2
+      ? `<button class="btn btn-ghost sm" style="margin-left:12px" onclick="dOpenSession('${dm2.id}')">⛓ Dağıtık MuSig2 oturumuna git →</button>`
+      : m2
+      ? `<button class="btn btn-ghost sm" style="margin-left:12px" onclick="showTab('musig2')">⊕ MuSig2 oturumuna git →</button>`
+      : `<button class="btn btn-ghost sm" style="margin-left:12px" onclick="quickSend('${filterAddr}')">Bu adresten gönder →</button>`;
     panel.innerHTML = `
       <div style="font-size:12px;color:var(--text-2);margin-bottom:8px">
         <strong>${utxos.length} UTXO</strong> &mdash; Toplam: <strong style="color:var(--orange)">${totalSat.toLocaleString()} sat</strong>
-        <button class="btn btn-ghost sm" style="margin-left:12px" onclick="quickSend('${filterAddr}')">Bu adresten gönder →</button>
+        ${actionBtn}
       </div>
       <div class="table-wrap">
         <table class="data-table" style="font-size:12px">
@@ -577,20 +657,13 @@ function _updateTxScanTime(filterAddr) {
   }
 }
 
-function _explorerBase(filterAddr) {
-  if (!filterAddr) return 'https://mempool.space/testnet4';
-  for (const w of state.wallets) {
-    if (w.address === filterAddr || (state.hdScanResults[w.id]?.addresses || []).some(a => a.address === filterAddr)) {
-      return w.network === 'mainnet' ? 'https://mempool.space' : 'https://mempool.space/testnet4';
-    }
-  }
-  return 'https://mempool.space/testnet4';
-}
-
 // 3C: İmport edilmiş cüzdan için scan_since
 function _showScanSinceIfNeeded(filterAddr) {
   const el = document.getElementById('txScanSinceRow');
   if (!el) return;
+  // MuSig2 adresi ise scan_since gösterme
+  const isMusig = [...state.musig2Sessions, ...state.dmusig2Sessions].some(s => s.agg_address === filterAddr);
+  if (isMusig) { el.style.display = 'none'; return; }
   const w = state.wallets.find(x => x.address === filterAddr ||
     (state.hdScanResults[x.id]?.addresses || []).some(a => a.address === filterAddr));
   el.style.display = (w && w.hd_imported) ? '' : 'none';
@@ -1043,20 +1116,45 @@ function populateWalletSelects() {
     const el = document.getElementById(id);
     if (!el) return;
     const current = el.value;
-    const hasAll  = id === 'txFilterWallet';
-    let opts = hasAll ? '<option value="">Tüm Cüzdanlar</option>' : '<option value="">— Cüzdan seçin —</option>';
+    const isTx   = id === 'txFilterWallet';
+    let opts = isTx ? '<option value="">Tüm Cüzdanlar</option>' : '<option value="">— Cüzdan seçin —</option>';
 
-    state.wallets.forEach(w => {
-      // Birincil adres
-      opts += `<option value="${w.address}">${w.label} — ${w.address.substring(0, 16)}…</option>`;
-      // HD tarama ile keşfedilmiş alt adresler (bakiyesi olanlar)
-      const hdAddrs = w.hd_addresses || {};
-      Object.entries(hdAddrs).forEach(([idx, info]) => {
-        if (info.balance_sat > 0 || info.utxo_count > 0) {
-          opts += `<option value="${info.address}">${w.label} [${idx}] — ${info.address.substring(0, 16)}…</option>`;
-        }
+    // ── Cüzdanlar grubu ──
+    if (state.wallets.length) {
+      if (isTx) opts += '<optgroup label="── Cüzdanlar">';
+      state.wallets.forEach(w => {
+        opts += `<option value="${w.address}">${w.label} — ${w.address.substring(0, 16)}…</option>`;
+        const hdAddrs = w.hd_addresses || {};
+        Object.entries(hdAddrs).forEach(([idx, info]) => {
+          if (info.balance_sat > 0 || info.utxo_count > 0) {
+            opts += `<option value="${info.address}">${w.label} [${idx}] — ${info.address.substring(0, 16)}…</option>`;
+          }
+        });
       });
-    });
+      if (isTx) opts += '</optgroup>';
+    }
+
+    // ── MuSig2 grubu (yalnızca İşlemler dropdown'unda) ──
+    if (isTx) {
+      // Klasik MuSig2
+      const m2 = state.musig2Sessions.filter(s => s.agg_address);
+      if (m2.length) {
+        opts += '<optgroup label="── MuSig2">';
+        m2.forEach(s => {
+          opts += `<option value="${s.agg_address}" data-type="musig2" data-id="${s.id}">${s.label} — ${s.agg_address.substring(0, 16)}…</option>`;
+        });
+        opts += '</optgroup>';
+      }
+      // Dağıtık MuSig2
+      const dm2 = state.dmusig2Sessions.filter(s => s.agg_address);
+      if (dm2.length) {
+        opts += '<optgroup label="── Dağıtık MuSig2">';
+        dm2.forEach(s => {
+          opts += `<option value="${s.agg_address}" data-type="dmusig2" data-id="${s.id}">${s.label} — ${s.agg_address.substring(0, 16)}…</option>`;
+        });
+        opts += '</optgroup>';
+      }
+    }
 
     el.innerHTML = opts;
     if (current) el.value = current;
@@ -1882,6 +1980,10 @@ async function dLoadSessionList() {
 
     // Aktif listede yalnızca tamamlanmamış session'lar
     const active = sessions.filter(s => s.state !== 'BROADCAST' && s.state !== 'SIGNED');
+
+    // TX dropdown için state'i güncelle
+    state.dmusig2Sessions = active;
+    populateWalletSelects();
 
     if (!active.length) {
       el.innerHTML = '<div class="empty-state">Henüz dağıtık MuSig2 oturumu yok.<br>Yeni bir oturum oluşturun.</div>';
