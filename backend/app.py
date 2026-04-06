@@ -196,6 +196,11 @@ class WalletCreate(BaseModel):
     label: str
     network: str = "testnet"  # testnet | mainnet
 
+class WalletImport(BaseModel):
+    label: str
+    network: str = "testnet4"   # testnet4 | mainnet
+    master_xprv: str            # MASTER_TPRV veya MASTER_XPRV
+
 class TxRequest(BaseModel):
     from_address: str
     to_address: str
@@ -322,6 +327,37 @@ def _b58encode(data: bytes) -> str:
         else:
             break
     return result
+
+def _b58decode(s: str) -> bytes:
+    """Base58 string → bytes (checksum doğrulamasız)."""
+    n = 0
+    for ch in s:
+        n = n * 58 + _B58_CHARS.index(ch)
+    result = n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b""
+    pad = len(s) - len(s.lstrip("1"))
+    return b"\x00" * pad + result
+
+def decode_master_xprv(xprv_str: str) -> tuple:
+    """
+    MASTER_TPRV / MASTER_XPRV string → (master_sk: bytes, master_chain: bytes).
+    BIP-32 extended private key yapısı:
+      [4B version][1B depth][4B parent_fp][4B child_num][32B chain][1B 0x00][32B sk]
+    checksum (4B) son dört byte — toplam 82B payload.
+    """
+    raw = _b58decode(xprv_str)
+    if len(raw) < 78:
+        raise ValueError(f"Geçersiz xprv uzunluğu: {len(raw)}")
+    # Checksum doğrula
+    payload, chk = raw[:-4], raw[-4:]
+    expected = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
+    if chk != expected:
+        raise ValueError("xprv checksum hatası — geçersiz anahtar")
+    depth     = payload[4]
+    chain     = payload[13:45]   # bytes 13-44
+    sk        = payload[46:78]   # bytes 46-77 (byte 45 = 0x00 padding)
+    if depth != 0:
+        raise ValueError(f"Yalnızca master key (depth=0) destekleniyor, bu key depth={depth}")
+    return sk, chain
 
 def sk_to_wif(sk_bytes: bytes, testnet: bool = False) -> str:
     """32-bayt özel anahtar → WIF (sıkıştırılmış)."""
@@ -457,15 +493,23 @@ def _bip32_xprv(sk: bytes, chain: bytes, depth: int,
     chk = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
     return _b58encode(payload + chk)
 
-def _hd_child_for_address(seed_sk: bytes, testnet: bool):
+def _hd_child_for_address(seed_sk: Optional[bytes], testnet: bool,
+                           master_kv: Optional[tuple] = None):
     """
-    BIP-86 HD derivation: seed_sk → m/86'/coin_type'/0'/0/0 → BIP-341 P2TR.
+    BIP-86 HD derivation → m/86'/coin_type'/0'/0/0 → BIP-341 P2TR.
     Sparrow descriptor'ın ilk receive adresiyle (0/0) eşleşir.
+
+    master_kv=(master_sk, master_chain) verilirse seed HMAC adımı atlanır.
+    Bu, MASTER_TPRV'den import edilen cüzdanlarda kullanılır.
+
     Returns: (child_sk_bytes, internal_xonly_bytes, p2tr_address_str)
     """
     coin_type = 1 if testnet else 0
-    master_I = _hmac_mod.new(b'Bitcoin seed', seed_sk, hashlib.sha512).digest()
-    master_sk, master_chain = master_I[:32], master_I[32:]
+    if master_kv:
+        master_sk, master_chain = master_kv
+    else:
+        master_I = _hmac_mod.new(b'Bitcoin seed', seed_sk, hashlib.sha512).digest()
+        master_sk, master_chain = master_I[:32], master_I[32:]
     k1, c1, _ = _bip32_child(master_sk, master_chain, 0x80000000 + 86)
     k2, c2, _ = _bip32_child(k1, c1, 0x80000000 + coin_type)
     k3, c3, _ = _bip32_child(k2, c2, 0x80000000)
@@ -475,24 +519,28 @@ def _hd_child_for_address(seed_sk: bytes, testnet: bool):
     return k5, internal_xonly, address
 
 
-def make_sparrow_descriptor(sk_hex: str, testnet: bool = True):
+def make_sparrow_descriptor(sk_hex: Optional[str], testnet: bool = True,
+                             master_kv: Optional[tuple] = None):
     """
-    Raw private key → Sparrow-uyumlu BIP-32 HD Taproot descriptor + master xprv.
+    Raw private key (veya master_kv) → Sparrow-uyumlu BIP-32 HD Taproot descriptor + master xprv.
 
-    Ham private key BIP-32 seed olarak kullanılır:
-        master = HMAC-SHA512("Bitcoin seed", sk_bytes)
+    master_kv=(master_sk, master_chain) verilirse sk_hex'ten master türetme atlanır.
+    Bu, import edilen cüzdanlarda kullanılır (sk_hex = master_sk, master_chain ayrı saklanır).
 
     Sparrow testnet4 modunda: tpub + 86h/1h/0h  (BIP-86 testnet, coin_type=1)
     Sparrow mainnet modunda : xpub + 86h/0h/0h  (BIP-86 mainnet, coin_type=0)
 
     Returns: (descriptor_str, master_xprv_str)
     """
-    sk = bytes.fromhex(sk_hex)
     coin_type = 1 if testnet else 0
 
-    # BIP-32 master key: raw sk'yı seed olarak kullan
-    master_I = _hmac_mod.new(b'Bitcoin seed', sk, hashlib.sha512).digest()
-    master_sk, master_chain = master_I[:32], master_I[32:]
+    if master_kv:
+        master_sk, master_chain = master_kv
+    else:
+        sk = bytes.fromhex(sk_hex)
+        master_I = _hmac_mod.new(b'Bitcoin seed', sk, hashlib.sha512).digest()
+        master_sk, master_chain = master_I[:32], master_I[32:]
+
     master_pub = _bip32_pub_compressed(master_sk)
     master_fp = _bip32_hash160(master_pub)[:4]
 
@@ -516,7 +564,7 @@ def make_sparrow_descriptor(sk_hex: str, testnet: bool = True):
         depth=3,
         parent_fp=acct_parent_fp,
         child_num=0x80000000,
-        testnet=testnet,   # tpub (testnet) veya xpub (mainnet)
+        testnet=testnet,
     )
 
     fp_hex = master_fp.hex()
@@ -645,6 +693,47 @@ def list_wallets():
     return [wallet_public(w) for w in wallets]
 
 
+@app.post("/api/wallet/import")
+def import_wallet(req: WalletImport):
+    """
+    MASTER_TPRV / MASTER_XPRV'den Taproot cüzdanı import eder.
+
+    1. MASTER_TPRV decode → (master_sk, master_chain)
+    2. BIP-86 HD derivation: m/86'/coin_type'/0'/0/0 → adres türet
+    3. Cüzdanı kaydet (hd_imported=True, master_chain_hex ayrı saklanır)
+    """
+    try:
+        master_sk, master_chain = decode_master_xprv(req.master_xprv.strip())
+    except ValueError as e:
+        raise HTTPException(400, f"Anahtar çözümleme hatası: {e}")
+
+    # Aynı MASTER_TPRV ile ikinci kez import önlemi
+    master_sk_hex = master_sk.hex()
+    if any(w.get("sk_hex") == master_sk_hex and w.get("hd_imported") for w in wallets):
+        raise HTTPException(409, "Bu anahtar zaten import edilmiş")
+
+    testnet = req.network != "mainnet"
+    _, xonly_pk, address = _hd_child_for_address(
+        None, testnet, master_kv=(master_sk, master_chain)
+    )
+
+    wallet = {
+        "id":               str(uuid.uuid4())[:8],
+        "label":            req.label,
+        "sk_hex":           master_sk_hex,          # master private key
+        "master_chain_hex": master_chain.hex(),     # chain code (türetme için)
+        "xonly_pk":         xonly_pk.hex(),
+        "address":          address,
+        "network":          req.network,
+        "bip341":           True,
+        "hd":               True,
+        "hd_imported":      True,
+    }
+    wallets.append(wallet)
+    _save_wallets()
+    return wallet_public(wallet)
+
+
 @app.get("/api/wallet/export")
 def export_wallets():
     """
@@ -693,7 +782,12 @@ def export_wallet_bsms(label: str):
     address = w["address"]
     xonly   = w["xonly_pk"]
 
-    desc, master_xprv = make_sparrow_descriptor(sk_hex, testnet=testnet)
+    if w.get("hd_imported"):
+        master_chain = bytes.fromhex(w["master_chain_hex"])
+        master_kv = (bytes.fromhex(sk_hex), master_chain)
+        desc, master_xprv = make_sparrow_descriptor(None, testnet=testnet, master_kv=master_kv)
+    else:
+        desc, master_xprv = make_sparrow_descriptor(sk_hex, testnet=testnet)
     xprv_label = "MASTER_TPRV" if testnet else "MASTER_XPRV"
 
     content = (
@@ -881,7 +975,13 @@ def build_transaction(req: TxRequest):
     signing_sk = sk
     if w.get("hd"):
         testnet_w = w["network"] != "mainnet"
-        child_sk, _, _ = _hd_child_for_address(sk, testnet_w)
+        if w.get("hd_imported"):
+            master_chain = bytes.fromhex(w["master_chain_hex"])
+            child_sk, _, _ = _hd_child_for_address(
+                None, testnet_w, master_kv=(sk, master_chain)
+            )
+        else:
+            child_sk, _, _ = _hd_child_for_address(sk, testnet_w)
         _, signing_sk = taproot_tweak_key(child_sk)
     elif w.get("bip341"):
         _, signing_sk = taproot_tweak_key(sk)

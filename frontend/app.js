@@ -785,6 +785,87 @@ function closeModal(id) { document.getElementById(id).classList.remove('open'); 
 function openNewWalletModal()  { openModal('newWalletModal'); }
 function openMusig2Modal()     { openModal('newMusig2Modal'); }
 
+// ── Cüzdan Import ──────────────────────────────────────────────────────────
+
+function openImportWalletModal() {
+  document.getElementById('importWalletLabel').value    = '';
+  document.getElementById('importWalletTprv').value     = '';
+  document.getElementById('importWalletFile').value     = '';
+  document.getElementById('importWalletFileStatus').textContent = '';
+  document.getElementById('importWalletPreview').style.display = 'none';
+  openModal('importWalletModal');
+}
+
+function importWalletParseFile(input) {
+  const file = input.files[0];
+  if (!file) return;
+  const statusEl = document.getElementById('importWalletFileStatus');
+  statusEl.textContent = 'Okunuyor…';
+
+  const reader = new FileReader();
+  reader.onload = e => {
+    const text = e.target.result;
+    // MASTER_TPRV veya MASTER_XPRV satırını bul
+    const match = text.match(/(?:MASTER_TPRV|MASTER_XPRV)\s*(?:\(.*?\))?:\s*\n?([a-zA-Z0-9]+)/);
+    if (!match) {
+      statusEl.textContent = 'MASTER_TPRV satırı bulunamadı.';
+      statusEl.style.color = '#f85149';
+      return;
+    }
+    document.getElementById('importWalletTprv').value = match[1].trim();
+
+    // Etiketi dosya adından al (uzantısız)
+    const labelEl = document.getElementById('importWalletLabel');
+    if (!labelEl.value) {
+      labelEl.value = file.name.replace(/\.(txt|descriptor)$/i, '');
+    }
+
+    // Ağı tahmin et: "mainnet" geçiyorsa mainnet, yoksa testnet4
+    const net = text.includes('mainnet') ? 'mainnet' : 'testnet4';
+    document.getElementById('importWalletNetwork').value = net;
+
+    statusEl.textContent = 'Anahtar bulundu.';
+    statusEl.style.color = '#3fb950';
+  };
+  reader.readAsText(file);
+}
+
+async function importWalletPreview() {
+  const tprv = document.getElementById('importWalletTprv').value.trim();
+  const net  = document.getElementById('importWalletNetwork').value;
+  if (!tprv) { toast('MASTER_TPRV girin', 'error'); return; }
+  try {
+    // Backend'e preview isteği gönder (label geçici)
+    const res = await post('/api/wallet/import', {
+      label: '__preview__',
+      network: net,
+      master_xprv: tprv,
+    });
+    // Preview sonrası cüzdan kaydedildi — sil
+    await fetch(`/api/wallet/${res.id}`, { method: 'DELETE' });
+    document.getElementById('importWalletAddr').textContent = res.address;
+    document.getElementById('importWalletPreview').style.display = '';
+  } catch(e) {
+    toast(`Doğrulama hatası: ${e.message}`, 'error');
+  }
+}
+
+async function importWallet() {
+  const label = document.getElementById('importWalletLabel').value.trim();
+  const net   = document.getElementById('importWalletNetwork').value;
+  const tprv  = document.getElementById('importWalletTprv').value.trim();
+  if (!label) { toast('Etiket girin', 'error'); return; }
+  if (!tprv)  { toast('MASTER_TPRV girin', 'error'); return; }
+  try {
+    await post('/api/wallet/import', { label, network: net, master_xprv: tprv });
+    closeModal('importWalletModal');
+    toast('Cüzdan import edildi', 'success');
+    loadWallets();
+  } catch(e) {
+    toast(`Import hatası: ${e.message}`, 'error');
+  }
+}
+
 // Close modal on overlay click
 document.querySelectorAll('.modal-overlay').forEach(overlay => {
   overlay.addEventListener('click', e => {
@@ -820,7 +901,6 @@ let _dPolling   = false;  // uçuştaki polling isteği varken yeni tick'i atla 
 
 async function dEncryptSK(skHex, pin) {
   const enc = new TextEncoder();
-  const fromHex = hex => new Uint8Array(hex.match(/.{2}/g).map(b => parseInt(b, 16)));
   const km = await crypto.subtle.importKey('raw', enc.encode(pin), 'PBKDF2', false, ['deriveKey']);
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const key  = await crypto.subtle.deriveKey(
