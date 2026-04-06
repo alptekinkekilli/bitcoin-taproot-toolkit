@@ -493,30 +493,47 @@ def _bip32_xprv(sk: bytes, chain: bytes, depth: int,
     chk = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
     return _b58encode(payload + chk)
 
-def _hd_child_for_address(seed_sk: Optional[bytes], testnet: bool,
-                           master_kv: Optional[tuple] = None):
-    """
-    BIP-86 HD derivation → m/86'/coin_type'/0'/0/0 → BIP-341 P2TR.
-    Sparrow descriptor'ın ilk receive adresiyle (0/0) eşleşir.
+def _hd_master_keys(seed_sk: Optional[bytes], master_kv: Optional[tuple]) -> tuple:
+    """Seed veya master_kv'den (master_sk, master_chain) döner."""
+    if master_kv:
+        return master_kv
+    master_I = _hmac_mod.new(b'Bitcoin seed', seed_sk, hashlib.sha512).digest()
+    return master_I[:32], master_I[32:]
 
-    master_kv=(master_sk, master_chain) verilirse seed HMAC adımı atlanır.
-    Bu, MASTER_TPRV'den import edilen cüzdanlarda kullanılır.
+
+def _hd_child_at_index(seed_sk: Optional[bytes], testnet: bool,
+                        change: int = 0, index: int = 0,
+                        master_kv: Optional[tuple] = None):
+    """
+    BIP-86 HD derivation → m/86'/coin_type'/0'/change/index → BIP-341 P2TR.
+
+    change=0: receive  change=1: internal (change output)
+    master_kv=(master_sk, master_chain) verilirse HMAC adımı atlanır (import edilmiş cüzdanlar).
 
     Returns: (child_sk_bytes, internal_xonly_bytes, p2tr_address_str)
     """
     coin_type = 1 if testnet else 0
-    if master_kv:
-        master_sk, master_chain = master_kv
-    else:
-        master_I = _hmac_mod.new(b'Bitcoin seed', seed_sk, hashlib.sha512).digest()
-        master_sk, master_chain = master_I[:32], master_I[32:]
+    master_sk, master_chain = _hd_master_keys(seed_sk, master_kv)
     k1, c1, _ = _bip32_child(master_sk, master_chain, 0x80000000 + 86)
     k2, c2, _ = _bip32_child(k1, c1, 0x80000000 + coin_type)
     k3, c3, _ = _bip32_child(k2, c2, 0x80000000)
-    k4, c4, _ = _bip32_child(k3, c3, 0)   # external chain (receive)
-    k5, _c5, _ = _bip32_child(k4, c4, 0)  # first address index
+    k4, c4, _ = _bip32_child(k3, c3, change)
+    k5, _c5, _ = _bip32_child(k4, c4, index)
     internal_xonly, address = taproot_address(k5, testnet=testnet, bip341=True)
     return k5, internal_xonly, address
+
+
+def _hd_child_for_address(seed_sk: Optional[bytes], testnet: bool,
+                           master_kv: Optional[tuple] = None):
+    """index=0 receive adresi türetir. Geriye dönük uyumluluk için korundu."""
+    return _hd_child_at_index(seed_sk, testnet, change=0, index=0, master_kv=master_kv)
+
+
+def _wallet_master_kv(w: Dict) -> Optional[tuple]:
+    """hd_imported cüzdan için (master_sk, master_chain) döner, yoksa None."""
+    if w.get("hd_imported"):
+        return (bytes.fromhex(w["sk_hex"]), bytes.fromhex(w["master_chain_hex"]))
+    return None
 
 
 def make_sparrow_descriptor(sk_hex: Optional[str], testnet: bool = True,
@@ -616,6 +633,24 @@ def descsum_create(s: str) -> str:
 
 def find_wallet(address: str) -> Optional[Dict]:
     return next((w for w in wallets if w["address"] == address), None)
+
+def find_wallet_for_address(address: str) -> tuple:
+    """
+    Verilen adresi sahip cüzdanı ve HD indisini döner.
+
+    Önce birincil adreste arar, sonra hd_addresses içinde.
+    Returns: (wallet_dict, hd_index_or_None)
+      hd_index: int  → HD türetme indisi (0, 1, 2, …)
+      hd_index: None → birincil adres veya HD olmayan cüzdan
+    """
+    for w in wallets:
+        if w["address"] == address:
+            return w, None
+        hd_addrs = w.get("hd_addresses", {})
+        for idx_str, info in hd_addrs.items():
+            if info.get("address") == address:
+                return w, int(idx_str)
+    return None, None
 
 def esplora_base(network: str) -> str:
     return {
@@ -732,6 +767,89 @@ def import_wallet(req: WalletImport):
     wallets.append(wallet)
     _save_wallets()
     return wallet_public(wallet)
+
+
+@app.post("/api/wallet/{wallet_id}/hd-scan")
+def hd_scan(wallet_id: str, gap_limit: int = 20):
+    """
+    HD cüzdanın tüm receive adreslerini Esplora üzerinden tarar.
+
+    m/86'/coin_type'/0'/0/0 … /0/N adreslerini türetir.
+    Her adres için Esplora'dan UTXO sayısı ve bakiye çeker.
+    Sonuçları wallet.hd_addresses olarak kaydeder.
+
+    gap_limit: art arda bu kadar boş adres görülürse tarama durur (BIP-44 default=20).
+    Zorunlu HD cüzdan: hd=True olmayan cüzdanlarda 400 döner.
+    """
+    import urllib.request, json as _json
+
+    w = next((x for x in wallets if x["id"] == wallet_id), None)
+    if not w:
+        raise HTTPException(404, "Cüzdan bulunamadı")
+    if not w.get("hd"):
+        raise HTTPException(400, "Yalnızca HD cüzdanlar taranabilir")
+
+    testnet    = w["network"] != "mainnet"
+    seed_sk    = bytes.fromhex(w["sk_hex"]) if not w.get("hd_imported") else None
+    master_kv  = _wallet_master_kv(w)
+    base       = esplora_base(w["network"])
+
+    found      = []
+    gap        = 0
+    index      = 0
+
+    while gap < gap_limit and index < 200:   # max 200 adres güvenlik sınırı
+        _, xonly, address = _hd_child_at_index(
+            seed_sk, testnet, change=0, index=index, master_kv=master_kv
+        )
+        # Esplora adres bilgisi
+        utxo_count = 0
+        balance_sat = 0
+        try:
+            url = f"{base}/address/{address}"
+            with urllib.request.urlopen(url, timeout=10) as r:
+                info = _json.loads(r.read())
+            funded   = info.get("chain_stats", {}).get("funded_txo_sum", 0)
+            spent    = info.get("chain_stats", {}).get("spent_txo_sum", 0)
+            balance_sat = funded - spent
+            utxo_count  = info.get("chain_stats", {}).get("funded_txo_count", 0) \
+                        - info.get("chain_stats", {}).get("spent_txo_count", 0)
+        except Exception:
+            pass   # ağ hatası → boş kabul et
+
+        entry = {
+            "index":       index,
+            "address":     address,
+            "xonly_pk":    xonly.hex(),
+            "balance_sat": balance_sat,
+            "utxo_count":  utxo_count,
+        }
+        found.append(entry)
+
+        if balance_sat == 0 and utxo_count == 0:
+            gap += 1
+        else:
+            gap = 0
+
+        index += 1
+
+    # Tüm adresleri wallet'a kaydet (boş olanlar dahil — gap analizi için)
+    hd_addresses = {str(e["index"]): {
+        "address":     e["address"],
+        "xonly_pk":    e["xonly_pk"],
+        "balance_sat": e["balance_sat"],
+        "utxo_count":  e["utxo_count"],
+    } for e in found}
+    w["hd_addresses"] = hd_addresses
+    _save_wallets()
+
+    return {
+        "scanned": len(found),
+        "gap_limit": gap_limit,
+        "addresses": found,
+        "total_balance_sat": sum(e["balance_sat"] for e in found),
+        "active_count": sum(1 for e in found if e["balance_sat"] > 0),
+    }
 
 
 @app.get("/api/wallet/export")
@@ -916,13 +1034,19 @@ def build_transaction(req: TxRequest):
         Yanlış scriptPubKey → geçersiz sighash → "non-mandatory-script-verify-flag".
         P2TR için: 0x51 0x20 <32-byte-xonly> (34 byte, her zaman).
     """
-    w = find_wallet(req.from_address)
+    w, hd_index = find_wallet_for_address(req.from_address)
     if not w:
         raise HTTPException(404, "Kaynak cüzdan bulunamadı")
 
     sk = bytes.fromhex(w["sk_hex"])
-    xonly_pk = bytes.fromhex(w["xonly_pk"])
-    my_spk = build_p2tr_scriptpubkey(w["xonly_pk"])  # 0x51 0x20 + xonly
+
+    # HD alt adres için doğru xonly_pk ve spk türet
+    if hd_index is not None:
+        hd_info = w.get("hd_addresses", {}).get(str(hd_index), {})
+        xonly_pk = bytes.fromhex(hd_info["xonly_pk"])
+    else:
+        xonly_pk = bytes.fromhex(w["xonly_pk"])
+    my_spk = b'\x51\x20' + xonly_pk
 
     # ── UTXO Toplama (Core RPC veya Esplora) ─────────────────────────────────
     mgr = get_utxo_manager(w["network"])
@@ -969,19 +1093,18 @@ def build_transaction(req: TxRequest):
         change_sat = 0  # dust: ücrette erit
 
     # ── İmzalama (SIGHASH_DEFAULT = 0x00) ────────────────────────────────────
-    # hd=True  : HD wallet → child m/86'/…/0'/0/0 türet → BIP-341 tweak
-    # bip341   : Eski tek-key wallet → doğrudan tweak
-    # legacy   : Tweaksız (eski wallet'lar)
+    # hd=True        : HD wallet → child türet → BIP-341 tweak
+    #   hd_index≠None: birincil değil, alt adres — o index'i türet
+    # bip341         : Eski tek-key wallet → doğrudan tweak
     signing_sk = sk
     if w.get("hd"):
         testnet_w = w["network"] != "mainnet"
-        if w.get("hd_imported"):
-            master_chain = bytes.fromhex(w["master_chain_hex"])
-            child_sk, _, _ = _hd_child_for_address(
-                None, testnet_w, master_kv=(sk, master_chain)
-            )
-        else:
-            child_sk, _, _ = _hd_child_for_address(sk, testnet_w)
+        master_kv = _wallet_master_kv(w)
+        seed_sk   = None if master_kv else sk
+        idx       = hd_index if hd_index is not None else 0
+        child_sk, _, _ = _hd_child_at_index(
+            seed_sk, testnet_w, change=0, index=idx, master_kv=master_kv
+        )
         _, signing_sk = taproot_tweak_key(child_sk)
     elif w.get("bip341"):
         _, signing_sk = taproot_tweak_key(sk)

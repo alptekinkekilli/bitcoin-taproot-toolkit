@@ -602,22 +602,94 @@ function renderWalletsTable() {
     tbody.innerHTML = '<tr><td colspan="5" class="empty">Cüzdan yok</td></tr>';
     return;
   }
-  tbody.innerHTML = state.wallets.map(w => `
-    <tr>
-      <td><span class="bold">${w.label}</span></td>
+  tbody.innerHTML = state.wallets.map(w => {
+    const isHD = w.hd;
+    const scanBtn = isHD
+      ? `<button class="btn btn-ghost sm" onclick="hdScanWallet('${w.id}')" title="HD adreslerini tara">⟳ HD Tara</button>`
+      : '';
+    return `
+    <tr id="wallet-row-${w.id}">
+      <td><span class="bold">${w.label}</span>${w.hd_imported ? ' <span class="badge badge-yellow" style="font-size:9px">import</span>' : ''}</td>
       <td><span class="badge ${w.network === 'mainnet' ? 'badge-green' : 'badge-yellow'}">${w.network}</span></td>
       <td>
         <span class="mono-sm truncate" style="max-width:260px;display:inline-block">${w.address}</span>
         <button class="btn btn-ghost sm" onclick="copyAddr('${w.address}')" style="margin-left:4px">⎘</button>
       </td>
       <td><span class="mono-xs truncate" style="max-width:200px;display:inline-block">${w.xonly_pk}</span></td>
-      <td>
+      <td style="white-space:nowrap">
         <button class="btn btn-ghost sm" onclick="quickReceive('${w.address}')">Al</button>
+        ${scanBtn}
         <button class="btn btn-ghost sm" onclick="downloadBSMS('${w.label}')" title="Sparrow Wallet için Output Descriptor indir">⬇ Sparrow</button>
         <button class="btn btn-danger sm" onclick="removeWallet('${w.address}')">Sil</button>
       </td>
     </tr>
-  `).join('');
+    <tr id="wallet-hd-panel-${w.id}" style="display:none">
+      <td colspan="5" style="padding:0">
+        <div id="wallet-hd-body-${w.id}" style="padding:12px 16px;background:var(--bg-2);border-top:1px solid var(--border)"></div>
+      </td>
+    </tr>`;
+  }).join('');
+}
+
+// ── HD Cüzdan Tarama ──────────────────────────────────────────────────────────
+
+async function hdScanWallet(walletId) {
+  const panel  = document.getElementById(`wallet-hd-panel-${walletId}`);
+  const body   = document.getElementById(`wallet-hd-body-${walletId}`);
+  if (!panel || !body) return;
+
+  // Toggle: zaten açıksa kapat
+  if (panel.style.display !== 'none') {
+    panel.style.display = 'none';
+    return;
+  }
+
+  panel.style.display = '';
+  body.innerHTML = '<div style="color:var(--text-3);font-size:13px;padding:8px 0">Adresler taranıyor (0–50)… lütfen bekleyin.</div>';
+
+  try {
+    const res = await post(`/api/wallet/${walletId}/hd-scan`, {});
+    const addrs = res.addresses.filter(a => a.balance_sat > 0 || a.utxo_count > 0);
+
+    if (!addrs.length) {
+      body.innerHTML = '<div style="color:var(--text-3);font-size:13px;padding:8px 0">Bakiye bulunan adres yok (gap_limit=20 tarandı).</div>';
+      return;
+    }
+
+    const totalSat = res.total_balance_sat;
+    body.innerHTML = `
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+        <span style="font-size:13px;color:var(--text-2)">${res.scanned} adres tarandı &mdash; <strong style="color:var(--orange)">${addrs.length} aktif</strong>, toplam <strong>${(totalSat/1e8).toFixed(8)} BTC</strong></span>
+        <button class="btn btn-ghost sm" onclick="document.getElementById('wallet-hd-panel-${walletId}').style.display='none'">Kapat</button>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table" style="font-size:12px">
+          <thead><tr><th>İndis</th><th>Adres</th><th>Bakiye</th><th>UTXO</th><th></th></tr></thead>
+          <tbody>
+            ${addrs.map(a => `
+              <tr>
+                <td style="color:var(--text-3)">${a.index}</td>
+                <td><span class="mono-xs" style="word-break:break-all">${a.address}</span></td>
+                <td><strong style="color:var(--orange)">${(a.balance_sat/1e8).toFixed(8)} BTC</strong></td>
+                <td>${a.utxo_count}</td>
+                <td>
+                  <button class="btn btn-ghost sm" onclick="copyText('${a.address}')">⎘</button>
+                  <button class="btn btn-ghost sm" onclick="quickSend('${a.address}')">Gönder</button>
+                </td>
+              </tr>`).join('')}
+          </tbody>
+        </table>
+      </div>`;
+
+    // Wallet select dropdown'larını da güncelle (Gönder formu için)
+    populateWalletSelects();
+  } catch(e) {
+    body.innerHTML = `<div style="color:#f85149;font-size:13px">Tarama hatası: ${e.message}</div>`;
+  }
+}
+
+function copyText(text) {
+  navigator.clipboard.writeText(text).then(() => toast('Kopyalandı', 'success')).catch(() => {});
 }
 
 async function exportWallets() {
@@ -722,8 +794,21 @@ function populateWalletSelects() {
     if (!el) return;
     const current = el.value;
     const hasAll  = id === 'txFilterWallet';
-    el.innerHTML = (hasAll ? '<option value="">Tüm Cüzdanlar</option>' : '<option value="">— Cüzdan seçin —</option>') +
-      state.wallets.map(w => `<option value="${w.address}">${w.label} — ${w.address.substring(0, 16)}…</option>`).join('');
+    let opts = hasAll ? '<option value="">Tüm Cüzdanlar</option>' : '<option value="">— Cüzdan seçin —</option>';
+
+    state.wallets.forEach(w => {
+      // Birincil adres
+      opts += `<option value="${w.address}">${w.label} — ${w.address.substring(0, 16)}…</option>`;
+      // HD tarama ile keşfedilmiş alt adresler (bakiyesi olanlar)
+      const hdAddrs = w.hd_addresses || {};
+      Object.entries(hdAddrs).forEach(([idx, info]) => {
+        if (info.balance_sat > 0 || info.utxo_count > 0) {
+          opts += `<option value="${info.address}">${w.label} [${idx}] — ${info.address.substring(0, 16)}…</option>`;
+        }
+      });
+    });
+
+    el.innerHTML = opts;
     if (current) el.value = current;
   });
 }
