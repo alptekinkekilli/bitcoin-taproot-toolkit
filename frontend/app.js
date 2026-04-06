@@ -60,9 +60,7 @@ function showTab(name) {
 
   if (name === 'dashboard') refreshDashboard();
   if (name === 'transactions') {
-    const filterAddr = document.getElementById('txFilterWallet')?.value || '';
-    _showScanSinceIfNeeded(filterAddr);
-    loadTxHistory();
+    txShowTab(txState.tab || 'wallets');
   }
   if (name === 'musig2') loadMusig2();
   if (name === 'musig2d') {
@@ -453,232 +451,221 @@ function copyTxHex() {
   if (hex) { copyToClipboard(hex); toast('Hex kopyalandı', 'success'); }
 }
 
-// ── Transactions ──────────────────────────────────────────────────────────────
+// ── Transactions (3-tab sistem) ───────────────────────────────────────────────
 
-async function loadTxHistory() {
-  const filterAddr = document.getElementById('txFilterWallet').value;
+// State
+const txState = {
+  tab: 'wallets',
+  // Cüzdanlar
+  wTxs: [], wFiltered: [], wPage: 1, wPageSize: 25,
+  // MuSig2
+  m2Sessions: [], m2Filtered: [], m2Page: 1, m2PageSize: 25,
+  // Dağıtık MuSig2
+  dm2Sessions: [], dm2Filtered: [], dm2Page: 1, dm2PageSize: 25,
+};
 
-  // UTXO paneli
-  await _renderTxUtxoPanel(filterAddr);
+function txShowTab(tab) {
+  txState.tab = tab;
+  ['wallets','musig2','dmusig2'].forEach(t => {
+    const pane = document.getElementById(`txPane-${t}`);
+    const btn  = document.getElementById(`txTab-${t}`);
+    const active = t === tab;
+    if (pane) pane.style.display = active ? '' : 'none';
+    if (btn) {
+      btn.style.borderBottomColor = active ? 'var(--orange)' : 'transparent';
+      btn.style.color = active ? 'var(--orange)' : 'var(--text-2)';
+    }
+  });
+  if (tab === 'wallets')  txwLoad();
+  if (tab === 'musig2')   txm2Load();
+  if (tab === 'dmusig2')  txdm2Load();
+}
 
-  const tbody = document.getElementById('txHistoryTable');
-  tbody.innerHTML = '<tr><td colspan="7" class="empty">Yükleniyor…</td></tr>';
+function txRefresh() {
+  if (txState.tab === 'wallets')  txwLoad();
+  if (txState.tab === 'musig2')   txm2Load();
+  if (txState.tab === 'dmusig2')  txdm2Load();
+}
 
-  const allAddresses = _txAddressesFor(filterAddr);
+// ── Cüzdanlar tab ─────────────────────────────────────────────────────────────
+
+function _txExplorerBase(network) {
+  return network === 'mainnet' ? 'https://mempool.space' : 'https://mempool.space/testnet4';
+}
+
+async function txwLoad() {
+  // Cüzdan dropdown'unu doldur
+  const sel = document.getElementById('txwWallet');
+  if (sel) {
+    const cur = sel.value;
+    let opts = '<option value="">Tüm Cüzdanlar</option>';
+    state.wallets.forEach(w => {
+      opts += `<option value="${w.address}">${w.label}</option>`;
+      const hdAddrs = w.hd_addresses || {};
+      Object.entries(hdAddrs).forEach(([idx, info]) => {
+        if (info.balance_sat > 0 || info.utxo_count > 0)
+          opts += `<option value="${info.address}">${w.label} [${idx}]</option>`;
+      });
+    });
+    sel.innerHTML = opts;
+    if (cur) sel.value = cur;
+  }
+
+  const filterAddr = document.getElementById('txwWallet')?.value || '';
+  _txwShowScanSince(filterAddr);
+  await _txwUtxoPanel(filterAddr);
+
+  const tbody = document.getElementById('txwBody');
+  if (tbody) tbody.innerHTML = '<tr><td colspan="7" class="empty">Yükleniyor…</td></tr>';
+
+  // Hangi adresleri tarayacağız?
+  let targets = [];
+  if (!filterAddr) {
+    state.wallets.forEach(w => {
+      targets.push({ addr: w.address, label: w.label, network: w.network });
+      const hdAddrs = w.hd_addresses || {};
+      Object.entries(hdAddrs).forEach(([idx, info]) => {
+        if (info.balance_sat > 0 || info.utxo_count > 0)
+          targets.push({ addr: info.address, label: `${w.label} [${idx}]`, network: w.network });
+      });
+    });
+  } else {
+    for (const w of state.wallets) {
+      if (w.address === filterAddr) { targets.push({ addr: filterAddr, label: w.label, network: w.network }); break; }
+      const hdAddrs = w.hd_addresses || {};
+      for (const [idx, info] of Object.entries(hdAddrs)) {
+        if (info.address === filterAddr) { targets.push({ addr: filterAddr, label: `${w.label} [${idx}]`, network: w.network }); break; }
+      }
+    }
+  }
 
   let allTxs = [];
-  for (const entry of allAddresses) {
+  for (const t of targets) {
     try {
-      const txs = await get(`/api/wallet/${entry.addr}/txs`);
-      state.txLastScan[entry.addr] = new Date().toLocaleTimeString('tr-TR');
-      allTxs = allTxs.concat(txs.map(t => ({ ...t, _entry: entry })));
+      const txs = await get(`/api/wallet/${t.addr}/txs`);
+      state.txLastScan[t.addr] = new Date().toLocaleTimeString('tr-TR');
+      allTxs = allTxs.concat(txs.map(tx => ({ ...tx, _label: t.label, _network: t.network, _addr: t.addr })));
     } catch {}
   }
 
-  _updateTxScanTime(filterAddr);
-
+  // Deduplicate
+  const seen = new Set();
+  allTxs = allTxs.filter(tx => { if (seen.has(tx.txid)) return false; seen.add(tx.txid); return true; });
   allTxs.sort((a, b) => (b.status?.block_time || 0) - (a.status?.block_time || 0));
 
-  // Tekrar eden TXID: birden fazla adrese gelen aynı TX — kaynakları birleştir
-  const txMap = new Map();
-  for (const tx of allTxs) {
-    if (txMap.has(tx.txid)) {
-      // Birden fazla kaynak adresi var — listeye ekle
-      txMap.get(tx.txid)._entries.push(tx._entry);
-    } else {
-      txMap.set(tx.txid, { ...tx, _entries: [tx._entry] });
-    }
-  }
-  const dedupedTxs = [...txMap.values()];
+  txState.wTxs = allTxs;
+  txState.wPage = 1;
 
-  if (!dedupedTxs.length) {
+  // Son tarama
+  const scanEl = document.getElementById('txwLastScan');
+  if (scanEl) scanEl.textContent = allTxs.length ? `Son tarama: ${new Date().toLocaleTimeString('tr-TR')}` : '';
+
+  txwRender();
+}
+
+function txwRender() {
+  const search = (document.getElementById('txwSearch')?.value || '').toLowerCase().trim();
+  let filtered = txState.wTxs;
+  if (search) {
+    filtered = filtered.filter(tx => {
+      const hay = [tx.txid, tx._label, tx._addr].filter(Boolean).join(' ').toLowerCase();
+      return hay.includes(search);
+    });
+  }
+  txState.wFiltered = filtered;
+
+  const countEl = document.getElementById('txwCount');
+  if (countEl) countEl.textContent = filtered.length ? `${filtered.length} işlem` : '';
+
+  const pages = Math.max(1, Math.ceil(filtered.length / txState.wPageSize));
+  if (txState.wPage > pages) txState.wPage = 1;
+  const start = (txState.wPage - 1) * txState.wPageSize;
+  const page  = filtered.slice(start, start + txState.wPageSize);
+
+  const tbody = document.getElementById('txwBody');
+  if (!tbody) return;
+  if (!filtered.length) {
     tbody.innerHTML = '<tr><td colspan="7" class="empty">İşlem bulunamadı</td></tr>';
+    document.getElementById('txwPager').innerHTML = '';
     return;
   }
 
-  tbody.innerHTML = dedupedTxs.map(tx => {
-    const date  = tx.status?.block_time
-      ? new Date(tx.status.block_time * 1000).toLocaleString('tr-TR') : '—';
+  tbody.innerHTML = page.map(tx => {
+    const date  = tx.status?.block_time ? new Date(tx.status.block_time * 1000).toLocaleString('tr-TR') : '—';
     const block = tx.status?.block_height ? `#${tx.status.block_height}` : 'Mempool';
     const outSum = tx.vout?.reduce((s, o) => s + o.value, 0) || 0;
-    const explorerUrl = _explorerUrlFor(tx._entries[0]);
-
-    // Kaynak etiketi(ler) — tıklanabilir navigasyon linkleri
-    const sourceHtml = tx._entries.map(e => _txSourceLink(e)).join(' ');
-
+    const base  = _txExplorerBase(tx._network);
+    const txShort = tx.txid.substring(0, 16) + '…';
     return `<tr>
-      <td><span class="mono-xs truncate" style="max-width:160px;display:inline-block">${tx.txid}</span></td>
+      <td><span class="bold" style="font-size:12px">${tx._label}</span></td>
+      <td>
+        <span class="mono-xs">${txShort}</span>
+        <button class="btn btn-ghost sm" style="padding:2px 5px;font-size:10px" onclick="copyToClipboard('${tx.txid}');toast('TXID kopyalandı','success')">⎘</button>
+      </td>
       <td class="muted" style="font-size:11px">${date}</td>
       <td><span class="muted">${block}</span></td>
       <td><span class="orange mono-sm">${outSum.toLocaleString()} sat</span></td>
       <td>${statusBadge(tx.status?.confirmed)}</td>
-      <td style="max-width:160px">${sourceHtml}</td>
-      <td><a class="link" href="${explorerUrl}" target="_blank" title="Explorer'da Aç">↗</a></td>
+      <td><a class="link" href="${base}/tx/${tx.txid}" target="_blank">↗</a></td>
     </tr>`;
   }).join('');
+
+  _txRenderPager('txwPager', pages, txState.wPage, p => { txState.wPage = p; txwRender(); });
 }
 
-// Kaynak linki: cüzdan → wallets tab, musig2 → session, dmusig2 → detay
-function _txSourceLink(entry) {
-  if (!entry) return '—';
-  const label = entry.label || '?';
-  if (entry.navType === 'wallet') {
-    return `<button class="btn btn-ghost sm" style="font-size:11px;padding:2px 6px"
-      onclick="showTab('wallets')" title="${entry.addr}">◻ ${label}</button>`;
-  }
-  if (entry.navType === 'musig2') {
-    return `<button class="btn btn-ghost sm" style="font-size:11px;padding:2px 6px"
-      onclick="showTab('musig2')" title="${entry.addr}">⊕ ${label}</button>`;
-  }
-  if (entry.navType === 'dmusig2') {
-    return `<button class="btn btn-ghost sm" style="font-size:11px;padding:2px 6px"
-      onclick="dOpenSession('${entry.navId}')" title="${entry.addr}">⛓ ${label}</button>`;
-  }
-  return `<span class="muted" style="font-size:11px">${label}</span>`;
+function txwClearFilters() {
+  const s = document.getElementById('txwSearch'); if (s) s.value = '';
+  const w = document.getElementById('txwWallet'); if (w) w.value = '';
+  txState.wPage = 1;
+  txwLoad();
 }
 
-function _explorerUrlFor(entry) {
-  // Cüzdanın veya session'ın ağına göre base URL
-  if (entry?.navType === 'wallet') {
-    const w = state.wallets.find(x => x.address === entry.navId);
-    const base = (w?.network === 'mainnet') ? 'https://mempool.space' : 'https://mempool.space/testnet4';
-    return base;
+function _txwShowScanSince(filterAddr) {
+  const row = document.getElementById('txwScanSinceRow');
+  if (!row) return;
+  const w = state.wallets.find(x => x.address === filterAddr ||
+    Object.values(x.hd_addresses || {}).some(a => a.address === filterAddr));
+  row.style.display = (w && w.hd_imported) ? 'flex' : 'none';
+  if (w && w.hd_imported && w.scan_since) {
+    const inp = document.getElementById('txwScanSinceInput');
+    if (inp && !inp.value) inp.value = new Date(w.scan_since * 1000).toISOString().slice(0, 10);
   }
-  if (entry?.navType === 'musig2') {
-    const s = state.musig2Sessions.find(x => x.id === entry.navId);
-    return s?.network === 'mainnet' ? 'https://mempool.space' : 'https://mempool.space/testnet4';
-  }
-  if (entry?.navType === 'dmusig2') {
-    const s = state.dmusig2SessionsAll.find(x => x.id === entry.navId);
-    return s?.network === 'mainnet' ? 'https://mempool.space' : 'https://mempool.space/testnet4';
-  }
-  return 'https://mempool.space/testnet4';
 }
 
-// Seçili adrese göre taranacak adresleri döner
-// {addr, label, navType, navId}[]
-// navType: 'wallet' | 'musig2' | 'dmusig2' | null
-// navId  : navigasyon hedefi (wallet.address veya session.id)
-function _txAddressesFor(filterAddr) {
-  if (!filterAddr) {
-    // Tüm: cüzdanlar + HD alt + aktif MuSig2 + dMusig2
-    const out = [];
-    state.wallets.forEach(w => {
-      out.push({ addr: w.address, label: w.label, navType: 'wallet', navId: w.address });
-      const scan = state.hdScanResults[w.id];
-      if (scan) scan.addresses.forEach(a => {
-        if (a.address !== w.address)
-          out.push({ addr: a.address, label: `${w.label} [${a.index ?? '?'}]`, navType: 'wallet', navId: w.address });
-      });
-    });
-    state.musig2Sessions.filter(s => s.agg_address).forEach(s =>
-      out.push({ addr: s.agg_address, label: s.label, navType: 'musig2', navId: s.id }));
-    // Arşiv dahil tüm dMusig2 session'ları tara
-    state.dmusig2SessionsAll.filter(s => s.agg_address).forEach(s =>
-      out.push({ addr: s.agg_address, label: s.label, navType: 'dmusig2', navId: s.id }));
-    return out;
-  }
-
-  // Tek adres — cüzdanlarda ara
-  for (const w of state.wallets) {
-    if (w.address === filterAddr)
-      return [{ addr: filterAddr, label: w.label, navType: 'wallet', navId: w.address }];
-    const scan = state.hdScanResults[w.id];
-    if (scan) {
-      const found = scan.addresses.find(a => a.address === filterAddr);
-      if (found)
-        return [{ addr: filterAddr, label: `${w.label} [${found.index ?? '?'}]`, navType: 'wallet', navId: w.address }];
-    }
-  }
-  // MuSig2'de ara
-  for (const s of state.musig2Sessions) {
-    if (s.agg_address === filterAddr)
-      return [{ addr: filterAddr, label: s.label, navType: 'musig2', navId: s.id }];
-  }
-  for (const s of state.dmusig2SessionsAll) {
-    if (s.agg_address === filterAddr)
-      return [{ addr: filterAddr, label: s.label, navType: 'dmusig2', navId: s.id }];
-  }
-  return [{ addr: filterAddr, label: filterAddr.substring(0, 12) + '…', navType: null, navId: null }];
-}
-
-// 3A: UTXO paneli
-async function _renderTxUtxoPanel(filterAddr) {
-  const panel = document.getElementById('txUtxoPanel');
+async function _txwUtxoPanel(filterAddr) {
+  const panel = document.getElementById('txwUtxoPanel');
   if (!panel) return;
   if (!filterAddr) { panel.style.display = 'none'; return; }
-
   panel.style.display = '';
-  panel.innerHTML = '<div style="color:var(--text-3);font-size:12px;padding:6px 0">UTXO yükleniyor…</div>';
-
+  panel.innerHTML = '<div style="color:var(--text-3);font-size:12px">UTXO yükleniyor…</div>';
   try {
-    const res = await fetch(`/api/wallet/${filterAddr}/utxos`);
-    const utxos = await res.json();
+    const utxos = await get(`/api/wallet/${filterAddr}/utxos`).catch(() => []);
     if (!Array.isArray(utxos) || !utxos.length) {
-      panel.innerHTML = '<div style="color:var(--text-3);font-size:12px;padding:6px 0">Bu adrese ait UTXO yok.</div>';
+      panel.innerHTML = '<div style="color:var(--text-3);font-size:12px">Bu adrese ait UTXO yok.</div>';
       return;
     }
     const totalSat = utxos.reduce((s, u) => s + (u.value || 0), 0);
-    // Adres türüne göre aksiyon butonu
-    const m2  = state.musig2Sessions.find(s => s.agg_address === filterAddr);
-    const dm2 = state.dmusig2SessionsAll.find(s => s.agg_address === filterAddr);
-    const actionBtn = dm2
-      ? `<button class="btn btn-ghost sm" style="margin-left:12px" onclick="dOpenSession('${dm2.id}')">⛓ Dağıtık MuSig2 oturumuna git →</button>`
-      : m2
-      ? `<button class="btn btn-ghost sm" style="margin-left:12px" onclick="showTab('musig2')">⊕ MuSig2 oturumuna git →</button>`
-      : `<button class="btn btn-ghost sm" style="margin-left:12px" onclick="quickSend('${filterAddr}')">Bu adresten gönder →</button>`;
     panel.innerHTML = `
       <div style="font-size:12px;color:var(--text-2);margin-bottom:8px">
-        <strong>${utxos.length} UTXO</strong> &mdash; Toplam: <strong style="color:var(--orange)">${totalSat.toLocaleString()} sat</strong>
-        ${actionBtn}
+        <strong>${utxos.length} UTXO</strong> — Toplam: <strong style="color:var(--orange)">${totalSat.toLocaleString()} sat</strong>
+        <button class="btn btn-ghost sm" style="margin-left:12px" onclick="quickSend('${filterAddr}')">Bu adresten gönder →</button>
       </div>
-      <div class="table-wrap">
-        <table class="data-table" style="font-size:12px">
-          <thead><tr><th>TXID:vout</th><th>Tutar</th><th>Onay</th></tr></thead>
-          <tbody>
-            ${utxos.map(u => `<tr>
-              <td><span class="mono-xs">${u.txid ? u.txid.substring(0,16) + '…:' + u.vout : '—'}</span></td>
-              <td><span class="orange">${(u.value || 0).toLocaleString()} sat</span></td>
-              <td>${u.confirmations >= 1 ? `<span class="badge badge-green">${u.confirmations}</span>` : '<span class="badge badge-yellow">0</span>'}</td>
-            </tr>`).join('')}
-          </tbody>
-        </table>
-      </div>`;
+      <div class="table-wrap"><table class="data-table" style="font-size:12px">
+        <thead><tr><th>TXID:vout</th><th>Tutar</th><th>Onay</th></tr></thead>
+        <tbody>${utxos.map(u => `<tr>
+          <td><span class="mono-xs">${u.txid ? u.txid.substring(0,16) + '…:' + u.vout : '—'}</span></td>
+          <td><span class="orange">${(u.value||0).toLocaleString()} sat</span></td>
+          <td>${u.confirmations >= 1 ? `<span class="badge badge-green">${u.confirmations}</span>` : '<span class="badge badge-yellow">0</span>'}</td>
+        </tr>`).join('')}</tbody>
+      </table></div>`;
   } catch {
     panel.innerHTML = '<div style="color:#f85149;font-size:12px">UTXO yüklenemedi.</div>';
   }
 }
 
-function _updateTxScanTime(filterAddr) {
-  const el = document.getElementById('txLastScanTime');
-  if (!el) return;
-  if (filterAddr && state.txLastScan[filterAddr]) {
-    el.textContent = `Son tarama: ${state.txLastScan[filterAddr]}`;
-  } else {
-    const times = Object.values(state.txLastScan);
-    el.textContent = times.length ? `Son tarama: ${times[times.length - 1]}` : '';
-  }
-}
-
-// 3C: İmport edilmiş cüzdan için scan_since
-function _showScanSinceIfNeeded(filterAddr) {
-  const el = document.getElementById('txScanSinceRow');
-  if (!el) return;
-  // MuSig2 adresi ise scan_since gösterme
-  const isMusig = [...state.musig2Sessions, ...state.dmusig2SessionsAll].some(s => s.agg_address === filterAddr);
-  if (isMusig) { el.style.display = 'none'; return; }
-  const w = state.wallets.find(x => x.address === filterAddr ||
-    (state.hdScanResults[x.id]?.addresses || []).some(a => a.address === filterAddr));
-  el.style.display = (w && w.hd_imported) ? '' : 'none';
-  if (w && w.hd_imported && w.scan_since) {
-    const el2 = document.getElementById('txScanSinceInput');
-    if (el2 && !el2.value) el2.value = new Date(w.scan_since * 1000).toISOString().slice(0, 10);
-  }
-}
-
 async function saveScanSince() {
-  const filterAddr = document.getElementById('txFilterWallet').value;
-  const dateVal    = document.getElementById('txScanSinceInput').value;
+  const filterAddr = document.getElementById('txwWallet')?.value;
+  const dateVal    = document.getElementById('txwScanSinceInput')?.value;
   if (!filterAddr || !dateVal) return;
   const ts = Math.floor(new Date(dateVal).getTime() / 1000);
   const w  = state.wallets.find(x => x.address === filterAddr);
@@ -686,10 +673,184 @@ async function saveScanSince() {
   try {
     await post(`/api/wallet/${w.id}/scan-since`, { since: ts });
     toast('Tarama tarihi kaydedildi', 'success');
-    loadTxHistory();
-  } catch(e) {
-    toast(e.message, 'error');
+    txwLoad();
+  } catch(e) { toast(e.message, 'error'); }
+}
+
+// ── MuSig2 tab ────────────────────────────────────────────────────────────────
+
+async function txm2Load() {
+  try {
+    txState.m2Sessions = await get('/api/musig2/list');
+  } catch { txState.m2Sessions = []; }
+  txState.m2Page = 1;
+  txm2Render();
+}
+
+function txm2Render() {
+  const search = (document.getElementById('txm2Search')?.value || '').toLowerCase().trim();
+  const status = document.getElementById('txm2Status')?.value || '';
+  const DONE   = new Set(['BROADCAST', 'SIGNED']);
+
+  let filtered = txState.m2Sessions.filter(s => {
+    if (status === 'active' && DONE.has(s.state)) return false;
+    if (status === 'done'   && !DONE.has(s.state)) return false;
+    if (search) {
+      const hay = [s.label, s.agg_address, s.id].filter(Boolean).join(' ').toLowerCase();
+      if (!hay.includes(search)) return false;
+    }
+    return true;
+  });
+  txState.m2Filtered = filtered;
+
+  const countEl = document.getElementById('txm2Count');
+  if (countEl) countEl.textContent = filtered.length ? `${filtered.length} session` : '';
+
+  const emptyEl = document.getElementById('txm2Empty');
+  const tbody   = document.getElementById('txm2Body');
+  if (!filtered.length) {
+    if (tbody)   tbody.innerHTML = '';
+    if (emptyEl) emptyEl.style.display = '';
+    document.getElementById('txm2Pager').innerHTML = '';
+    return;
   }
+  if (emptyEl) emptyEl.style.display = 'none';
+
+  const pages = Math.max(1, Math.ceil(filtered.length / txState.m2PageSize));
+  if (txState.m2Page > pages) txState.m2Page = 1;
+  const page = filtered.slice((txState.m2Page - 1) * txState.m2PageSize, txState.m2Page * txState.m2PageSize);
+  const base = n => _txExplorerBase(n);
+
+  tbody.innerHTML = page.map(s => {
+    const isDone   = DONE.has(s.state);
+    const badge    = isDone
+      ? '<span class="badge badge-green">✓ Yayınlandı</span>'
+      : `<span class="badge badge-yellow">${s.state}</span>`;
+    const txShort  = s.txid ? s.txid.substring(0, 16) + '…' : '—';
+    const txidAct  = s.txid
+      ? `<button class="btn btn-ghost sm" style="padding:2px 5px;font-size:10px" onclick="copyToClipboard('${s.txid}');toast('TXID kopyalandı','success')">⎘</button>
+         <a class="btn btn-ghost sm" style="padding:2px 5px;font-size:10px" href="${base(s.network)}/tx/${s.txid}" target="_blank">↗</a>` : '';
+    const addrShort = s.to_address ? s.to_address.substring(0, 14) + '…' : '—';
+    const amtStr    = s.amount_sat != null ? s.amount_sat.toLocaleString() + ' sat' : '—';
+    return `<tr onclick="showTab('musig2')" style="cursor:pointer">
+      <td><span class="bold">${s.label}</span></td>
+      <td><span class="mono-xs" style="color:var(--text-3)">${s.network}</span></td>
+      <td><span class="mono-xs">${txShort}</span>${txidAct}</td>
+      <td><span class="orange bold">${amtStr}</span></td>
+      <td><span class="mono-xs" title="${s.to_address||''}">${addrShort}</span></td>
+      <td>${badge}</td>
+      <td><button class="btn btn-ghost sm" onclick="event.stopPropagation();showTab('musig2')">Aç →</button></td>
+    </tr>`;
+  }).join('');
+
+  _txRenderPager('txm2Pager', pages, txState.m2Page, p => { txState.m2Page = p; txm2Render(); });
+}
+
+function txm2ClearFilters() {
+  const s = document.getElementById('txm2Search'); if (s) s.value = '';
+  const st = document.getElementById('txm2Status'); if (st) st.value = '';
+  txState.m2Page = 1; txm2Render();
+}
+
+// ── Dağıtık MuSig2 tab ────────────────────────────────────────────────────────
+
+async function txdm2Load() {
+  try {
+    txState.dm2Sessions = await get('/api/musig2d/list');
+    // state.dmusig2SessionsAll'ı da güncelle (tutarlılık için)
+    state.dmusig2SessionsAll = txState.dm2Sessions;
+    state.dmusig2Sessions = txState.dm2Sessions.filter(s => s.state !== 'BROADCAST' && s.state !== 'SIGNED');
+  } catch { txState.dm2Sessions = []; }
+  txState.dm2Page = 1;
+  txdm2Render();
+}
+
+function txdm2Render() {
+  const search = (document.getElementById('txdm2Search')?.value || '').toLowerCase().trim();
+  const net    = document.getElementById('txdm2Net')?.value || '';
+  const minAmt = parseInt(document.getElementById('txdm2Min')?.value) || 0;
+  const maxAmt = parseInt(document.getElementById('txdm2Max')?.value) || Infinity;
+  const status = document.getElementById('txdm2Status')?.value || '';
+  const DONE   = new Set(['BROADCAST', 'SIGNED']);
+
+  let filtered = txState.dm2Sessions.filter(s => {
+    if (net && s.network !== net) return false;
+    if (status === 'active' && DONE.has(s.state)) return false;
+    if (status === 'done'   && !DONE.has(s.state)) return false;
+    if (minAmt && (s.amount_sat || 0) < minAmt) return false;
+    if (maxAmt !== Infinity && (s.amount_sat || 0) > maxAmt) return false;
+    if (search) {
+      const hay = [s.label, s.txid, s.to_address, s.id, s.agg_address].filter(Boolean).join(' ').toLowerCase();
+      if (!hay.includes(search)) return false;
+    }
+    return true;
+  });
+  txState.dm2Filtered = filtered;
+
+  const countEl = document.getElementById('txdm2Count');
+  if (countEl) countEl.textContent = filtered.length ? `${filtered.length} session` : '';
+
+  const emptyEl = document.getElementById('txdm2Empty');
+  const tbody   = document.getElementById('txdm2Body');
+  if (!filtered.length) {
+    if (tbody)   tbody.innerHTML = '';
+    if (emptyEl) emptyEl.style.display = '';
+    document.getElementById('txdm2Pager').innerHTML = '';
+    return;
+  }
+  if (emptyEl) emptyEl.style.display = 'none';
+
+  const pages = Math.max(1, Math.ceil(filtered.length / txState.dm2PageSize));
+  if (txState.dm2Page > pages) txState.dm2Page = 1;
+  const page = filtered.slice((txState.dm2Page - 1) * txState.dm2PageSize, txState.dm2Page * txState.dm2PageSize);
+
+  tbody.innerHTML = page.map(s => {
+    const DONE_SET = new Set(['BROADCAST', 'SIGNED']);
+    const badge    = s.state === 'BROADCAST'
+      ? '<span class="badge badge-green">✓ Yayınlandı</span>'
+      : DONE_SET.has(s.state)
+      ? '<span class="badge badge-yellow">İmzalandı</span>'
+      : dStateBadge(s.state);
+    const dateStr   = s.created_at ? new Date(s.created_at * 1000).toLocaleString('tr-TR') : '—';
+    const txShort   = s.txid ? s.txid.substring(0, 16) + '…' : '—';
+    const base      = _txExplorerBase(s.network);
+    const txidAct   = s.txid
+      ? `<button class="btn btn-ghost sm" style="padding:2px 5px;font-size:10px" onclick="event.stopPropagation();copyToClipboard('${s.txid}');toast('TXID kopyalandı','success')">⎘</button>
+         <a class="btn btn-ghost sm" style="padding:2px 5px;font-size:10px" href="${base}/tx/${s.txid}" target="_blank" onclick="event.stopPropagation()">↗</a>` : '';
+    const addrShort = s.to_address ? s.to_address.substring(0, 14) + '…' : '—';
+    const amtStr    = s.amount_sat != null ? s.amount_sat.toLocaleString() + ' sat' : '—';
+    const feeRow    = s.fee_sat ? `<div class="mono-xs" style="color:var(--text-3)">fee: ${s.fee_sat.toLocaleString()} sat</div>` : '';
+    return `<tr onclick="dOpenSession('${s.id}')" style="cursor:pointer">
+      <td><span class="bold">${s.label}</span></td>
+      <td><span class="mono-xs" style="color:var(--text-3)">${s.network}</span></td>
+      <td><span class="mono-xs">${txShort}</span>${txidAct}</td>
+      <td style="font-size:12px;color:var(--text-3)">${dateStr}</td>
+      <td><span class="orange bold">${amtStr}</span>${feeRow}</td>
+      <td class="d-hide-mobile"><span class="mono-xs" title="${s.to_address||''}">${addrShort}</span></td>
+      <td>${badge}</td>
+      <td><button class="btn btn-ghost sm" onclick="event.stopPropagation();dOpenSession('${s.id}')">Aç →</button></td>
+    </tr>`;
+  }).join('');
+
+  _txRenderPager('txdm2Pager', pages, txState.dm2Page, p => { txState.dm2Page = p; txdm2Render(); });
+}
+
+function txdm2ClearFilters() {
+  ['txdm2Search','txdm2Min','txdm2Max'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
+  const net = document.getElementById('txdm2Net'); if (net) net.value = '';
+  const st  = document.getElementById('txdm2Status'); if (st) st.value = '';
+  txState.dm2Page = 1; txdm2Render();
+}
+
+// Ortak pager
+function _txRenderPager(id, pages, current, onPage) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  if (pages <= 1) { el.innerHTML = ''; return; }
+  el.innerHTML =
+    `<button class="btn btn-ghost sm" ${current === 1 ? 'disabled style="opacity:.4"' : ''} onclick="(${onPage})(${current - 1})">← Önceki</button>` +
+    `<span style="font-size:12px;color:var(--text-3);padding:0 10px">${current} / ${pages}</span>` +
+    `<button class="btn btn-ghost sm" ${current === pages ? 'disabled style="opacity:.4"' : ''} onclick="(${onPage})(${current + 1})">Sonraki →</button>`;
 }
 
 // ── MuSig2 ────────────────────────────────────────────────────────────────────
@@ -1114,52 +1275,15 @@ async function createMusig2Session() {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function populateWalletSelects() {
-  const selects = ['receiveWalletSelect', 'sendFromSelect', 'txFilterWallet'];
+  const selects = ['receiveWalletSelect', 'sendFromSelect'];
   selects.forEach(id => {
     const el = document.getElementById(id);
     if (!el) return;
     const current = el.value;
-    const isTx   = id === 'txFilterWallet';
-    let opts = isTx ? '<option value="">Tüm Cüzdanlar</option>' : '<option value="">— Cüzdan seçin —</option>';
-
-    // ── Cüzdanlar grubu ──
-    if (state.wallets.length) {
-      if (isTx) opts += '<optgroup label="── Cüzdanlar">';
-      state.wallets.forEach(w => {
-        opts += `<option value="${w.address}">${w.label} — ${w.address.substring(0, 16)}…</option>`;
-        const hdAddrs = w.hd_addresses || {};
-        Object.entries(hdAddrs).forEach(([idx, info]) => {
-          if (info.balance_sat > 0 || info.utxo_count > 0) {
-            opts += `<option value="${info.address}">${w.label} [${idx}] — ${info.address.substring(0, 16)}…</option>`;
-          }
-        });
-      });
-      if (isTx) opts += '</optgroup>';
-    }
-
-    // ── MuSig2 grubu (yalnızca İşlemler dropdown'unda) ──
-    if (isTx) {
-      // Klasik MuSig2
-      const m2 = state.musig2Sessions.filter(s => s.agg_address);
-      if (m2.length) {
-        opts += '<optgroup label="── MuSig2">';
-        m2.forEach(s => {
-          opts += `<option value="${s.agg_address}" data-type="musig2" data-id="${s.id}">${s.label} — ${s.agg_address.substring(0, 16)}…</option>`;
-        });
-        opts += '</optgroup>';
-      }
-      // Dağıtık MuSig2 — arşiv dahil tümü (TX geçmişi için)
-      const dm2 = state.dmusig2SessionsAll.filter(s => s.agg_address);
-      if (dm2.length) {
-        opts += '<optgroup label="── Dağıtık MuSig2">';
-        dm2.forEach(s => {
-          const stateTag = (s.state === 'BROADCAST' || s.state === 'SIGNED') ? ' ✓' : '';
-          opts += `<option value="${s.agg_address}" data-type="dmusig2" data-id="${s.id}">${s.label}${stateTag} — ${s.agg_address.substring(0, 16)}…</option>`;
-        });
-        opts += '</optgroup>';
-      }
-    }
-
+    let opts = '<option value="">— Cüzdan seçin —</option>';
+    state.wallets.forEach(w => {
+      opts += `<option value="${w.address}">${w.label} — ${w.address.substring(0, 16)}…</option>`;
+    });
     el.innerHTML = opts;
     if (current) el.value = current;
   });
