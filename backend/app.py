@@ -1177,6 +1177,24 @@ def build_transaction(req: TxRequest):
     # addr_info'da _collect_utxos_for_address tarafından chain'den gelen
     # doğru Q.x SPK kaydedildi — my_spk (P.x tabanlı) yerine bunu kullan.
     change_spk = addr_info.get(req.from_address, (my_spk, None))[0]
+
+    # ── GÜVENLİK: Change SPK ↔ from_address doğrulaması ─────────────────────
+    # from_address'i bech32m decode edip SPK elde et; change_spk ile karşılaştır.
+    # Bunlar farklıysa fonlar geri dönmez — TX'i oluşturmadan önce durdur.
+    try:
+        expected_change_spk = address_to_scriptpubkey(req.from_address)
+    except ValueError as exc:
+        raise HTTPException(400, f"Kaynak adres hatalı: {exc}")
+    if change_spk != expected_change_spk:
+        raise HTTPException(500,
+            f"GÜVENLİK HATASI: Change output SPK from_address ile eşleşmiyor. "
+            f"TX iptal edildi.\n"
+            f"  Beklenen SPK : {expected_change_spk.hex()}\n"
+            f"  Hesaplanan   : {change_spk.hex()}\n"
+            f"Bu hata genellikle yanlış xonly_pk (internal vs output key) "
+            f"kaynaklanır. Lütfen bildir."
+        )
+
     outputs = [TxOutput(req.amount_sat, recipient_spk)]
     if change_sat > CoinSelector.DUST_LIMIT_SAT:
         outputs.append(TxOutput(change_sat, change_spk))
