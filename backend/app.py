@@ -1173,9 +1173,13 @@ def build_transaction(req: TxRequest):
         raise HTTPException(400, str(e))
 
     # ── TX Çıktıları ──────────────────────────────────────────────────────────
+    # Change output için from_address'in gerçek P2TR SPK'sını kullan.
+    # addr_info'da _collect_utxos_for_address tarafından chain'den gelen
+    # doğru Q.x SPK kaydedildi — my_spk (P.x tabanlı) yerine bunu kullan.
+    change_spk = addr_info.get(req.from_address, (my_spk, None))[0]
     outputs = [TxOutput(req.amount_sat, recipient_spk)]
     if change_sat > CoinSelector.DUST_LIMIT_SAT:
-        outputs.append(TxOutput(change_sat, my_spk))
+        outputs.append(TxOutput(change_sat, change_spk))
     else:
         change_sat = 0
 
