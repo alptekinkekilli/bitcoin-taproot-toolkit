@@ -1076,11 +1076,17 @@ def build_transaction(req: TxRequest):
             utxos = mgr.fetch_utxos(addr)
         except Exception:
             return []
+        # Esplora zaten Q.x (output/tweaked xonly) içeren SPK verir.
+        # Hesaplanan spk internal P.x kullanıyor olabilir — chain'den gelen değeri öncelikle al.
+        chain_spk = next(
+            (u.scriptpubkey for u in utxos if u.scriptpubkey and len(u.scriptpubkey) == 34),
+            spk  # UTXO yoksa fallback (yine de signing gerekmez)
+        )
         for u in utxos:
             if not u.scriptpubkey or len(u.scriptpubkey) != 34:
-                u.scriptpubkey = spk
+                u.scriptpubkey = chain_spk
                 u.is_p2tr = True
-        addr_info[addr] = (spk, tweaked_sk)
+        addr_info[addr] = (chain_spk, tweaked_sk)
         return [u for u in utxos if u.confirmations >= 1]
 
     confirmed_utxos: list = []
