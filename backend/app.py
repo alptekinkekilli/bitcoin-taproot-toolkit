@@ -1063,50 +1063,91 @@ def build_transaction(req: TxRequest):
         xonly_pk = bytes.fromhex(w["xonly_pk"])
     my_spk = b'\x51\x20' + xonly_pk
 
-    # ── UTXO Toplama (Core RPC veya Esplora) ─────────────────────────────────
+    # ── UTXO Toplama ─────────────────────────────────────────────────────────
+    # HD cüzdanlar için tüm alt-adres UTXO'larını da topla (coin control veya
+    # otomatik seçimde yeterli bakiye olabilmesi için).
     mgr = get_utxo_manager(w["network"])
-    try:
-        all_utxos = mgr.fetch_utxos(req.from_address)
-    except Exception as e:
-        raise HTTPException(502, f"UTXO sorgusu başarısız: {e}")
 
-    confirmed_utxos = [u for u in all_utxos if u.confirmations >= 1]
+    # adres → (spk, tweaked_signing_sk) haritası — imzalama için lazım
+    addr_info: dict[str, tuple[bytes, bytes]] = {}
+
+    def _collect_utxos_for_address(addr: str, spk: bytes, tweaked_sk: bytes) -> list:
+        try:
+            utxos = mgr.fetch_utxos(addr)
+        except Exception:
+            return []
+        for u in utxos:
+            if not u.scriptpubkey or len(u.scriptpubkey) != 34:
+                u.scriptpubkey = spk
+                u.is_p2tr = True
+        addr_info[addr] = (spk, tweaked_sk)
+        return [u for u in utxos if u.confirmations >= 1]
+
+    confirmed_utxos: list = []
+
+    if w.get("hd"):
+        testnet_w = w["network"] != "mainnet"
+        master_kv = _wallet_master_kv(w)
+        seed_sk   = None if master_kv else sk
+
+        # Tüm bilinen HD alt-adreslerini tara
+        for idx_str, info in w.get("hd_addresses", {}).items():
+            sub_idx = int(idx_str)
+            sub_addr = info.get("address", "")
+            if not sub_addr:
+                continue
+            child_sk, _, _ = _hd_child_at_index(seed_sk, testnet_w, 0, sub_idx, master_kv)
+            _, tweaked = taproot_tweak_key(child_sk)
+            sub_spk = b'\x51\x20' + bytes.fromhex(info["xonly_pk"])
+            confirmed_utxos.extend(_collect_utxos_for_address(sub_addr, sub_spk, tweaked))
+
+        # Birincil adres de taranacaksa (index 0 hd_addresses'de yoksa)
+        if req.from_address not in addr_info:
+            child_sk0, _, _ = _hd_child_at_index(seed_sk, testnet_w, 0, 0, master_kv)
+            _, tweaked0 = taproot_tweak_key(child_sk0)
+            confirmed_utxos.extend(_collect_utxos_for_address(req.from_address, my_spk, tweaked0))
+    else:
+        # Tek-anahtar cüzdan
+        if w.get("bip341"):
+            _, tweaked_sk = taproot_tweak_key(sk)
+        else:
+            tweaked_sk = sk
+        try:
+            utxos = mgr.fetch_utxos(req.from_address)
+        except Exception as e:
+            raise HTTPException(502, f"UTXO sorgusu başarısız: {e}")
+        for u in utxos:
+            if not u.scriptpubkey or len(u.scriptpubkey) != 34:
+                u.scriptpubkey = my_spk
+                u.is_p2tr = True
+        addr_info[req.from_address] = (my_spk, tweaked_sk)
+        confirmed_utxos = [u for u in utxos if u.confirmations >= 1]
+
     if not confirmed_utxos:
         raise HTTPException(400, "Onaylanmış P2TR UTXO bulunamadı")
 
-    # ── scriptPubKey Doğrulama ────────────────────────────────────────────────
-    # Core UTXO'ları için scriptpubkey dolu, Esplora için inşa et
-    for cu in confirmed_utxos:
-        if not cu.scriptpubkey or len(cu.scriptpubkey) != 34:
-            cu.scriptpubkey = my_spk
-            cu.is_p2tr = True
-
     # ── Alıcı scriptPubKey ────────────────────────────────────────────────────
-    # P2TR (tb1p/bc1p), P2WPKH (tb1q/bc1q) dahil tüm segwit tipleri desteklenir.
-    # BIP-341 TapSighash yalnızca INPUT scriptpubkey'lerini kapsar (sha_scriptpubkeys),
-    # çıktı scriptpubkey tipi sighash hesabını etkilemez.
-    # Adres doğrudan bech32/bech32m decode ile scriptpubkey'e çevrilir —
-    # Esplora'ya gerek yok, ağ bağımsız çalışır.
     try:
         recipient_spk = address_to_scriptpubkey(req.to_address)
     except ValueError as exc:
         raise HTTPException(400, f"Alıcı adres hatalı: {exc}")
 
     # ── Coin Selection ────────────────────────────────────────────────────────
-    # Kullanıcı belirli UTXO'lar seçmişse (coin control) önce onları ekle;
-    # toplam yetmezse smallest-first ile geri kalanlardan tamamla.
+    # Kullanıcı UTXO seçmişse önce onlar, yetmezse smallest-first ile tamamla.
     try:
         if req.utxo_ids:
             pinned_set = set(req.utxo_ids)
             pinned  = [u for u in confirmed_utxos if f"{u.txid}:{u.vout}" in pinned_set]
-            rest    = [u for u in confirmed_utxos if f"{u.txid}:{u.vout}" not in pinned_set]
+            rest    = sorted(
+                [u for u in confirmed_utxos if f"{u.txid}:{u.vout}" not in pinned_set],
+                key=lambda u: u.value
+            )
             pinned_total = sum(u.value for u in pinned)
             need = req.amount_sat + req.fee_sat
             if pinned_total >= need:
-                selected  = pinned
+                selected   = pinned
                 change_sat = pinned_total - need
             else:
-                # Pinned yetmedi — smallest-first ile kalan UTXO'lardan tamamla
                 extra, extra_change = CoinSelector.smallest_first(
                     rest, need - pinned_total, 0
                 )
@@ -1124,33 +1165,44 @@ def build_transaction(req: TxRequest):
     if change_sat > CoinSelector.DUST_LIMIT_SAT:
         outputs.append(TxOutput(change_sat, my_spk))
     else:
-        change_sat = 0  # dust: ücrette erit
+        change_sat = 0
 
-    # ── İmzalama (SIGHASH_DEFAULT = 0x00) ────────────────────────────────────
-    # hd=True        : HD wallet → child türet → BIP-341 tweak
-    #   hd_index≠None: birincil değil, alt adres — o index'i türet
-    # bip341         : Eski tek-key wallet → doğrudan tweak
-    signing_sk = sk
-    if w.get("hd"):
-        testnet_w = w["network"] != "mainnet"
-        master_kv = _wallet_master_kv(w)
-        seed_sk   = None if master_kv else sk
-        idx       = hd_index if hd_index is not None else 0
-        child_sk, _, _ = _hd_child_at_index(
-            seed_sk, testnet_w, change=0, index=idx, master_kv=master_kv
-        )
-        _, signing_sk = taproot_tweak_key(child_sk)
-    elif w.get("bip341"):
-        _, signing_sk = taproot_tweak_key(sk)
+    # ── Per-input signing key listesi ─────────────────────────────────────────
+    # Her UTXO'nun scriptpubkey'i hangi adrese aitse o adresin sk'sini kullan.
+    # addr_info: { address → (spk, tweaked_sk) }
+    spk_to_tweaked: dict[bytes, bytes] = {spk: tsk for spk, tsk in addr_info.values()}
+
+    sk_per_input: list[bytes] = []
+    for u in selected:
+        tweaked = spk_to_tweaked.get(u.scriptpubkey)
+        if tweaked is None:
+            raise HTTPException(500, f"İmza anahtarı bulunamadı: spk={u.scriptpubkey.hex()}")
+        sk_per_input.append(tweaked)
+
+    # Tek-anahtar durumda sk_per_input yerine sadece sk kullan (backward-compat)
+    single_sk = sk_per_input[0] if len(set(sk_per_input)) == 1 else None
 
     signer = TaprootSigner(sighash_type=SighashType.DEFAULT)
     try:
-        raw, witnesses = signer.sign_transaction(signing_sk, selected, outputs)
+        if single_sk:
+            raw, witnesses = signer.sign_transaction(single_sk, selected, outputs)
+        else:
+            raw, witnesses = signer.sign_transaction(
+                sk_per_input[0], selected, outputs, sk_per_input=sk_per_input
+            )
     except ValueError as e:
         raise HTTPException(400, f"İmzalama hatası: {e}")
 
     tx_hex = raw.hex()
     summary = TaprootSigner.decode_tx_summary(raw)
+
+    # Hangi UTXO'ların kullanıldığını frontend'e bildir
+    # (adres→label için frontend kendi eşleştirmesini yapar)
+    used_utxos = [
+        {"txid": u.txid, "vout": u.vout, "value": u.value,
+         "id": f"{u.txid}:{u.vout}"}
+        for u in selected
+    ]
 
     return {
         "tx_hex": tx_hex,
@@ -1162,6 +1214,7 @@ def build_transaction(req: TxRequest):
         "output_count": len(outputs),
         "sighash_type": "SIGHASH_DEFAULT (0x00)",
         "signature": witnesses[0].hex() if witnesses else "",
+        "used_utxos": used_utxos,
     }
 
 

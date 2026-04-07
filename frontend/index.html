@@ -171,10 +171,17 @@
             <div class="tx-detail-row"><span>Para Üstü</span><span id="txChange">—</span></div>
             <div class="tx-detail-row"><span>İmza</span><span id="txSig" class="mono-sm">—</span></div>
           </div>
+
+          <!-- Kullanılacak UTXO'lar -->
+          <div id="txUsedUtxos" style="margin:14px 0 10px">
+            <div class="form-label" style="margin-bottom:6px">Kullanılacak UTXO'lar</div>
+            <div id="txUsedUtxoList" style="font-size:12px;color:var(--text-3)"></div>
+          </div>
+
           <label class="form-label">Ham TX (hex)</label>
           <textarea class="form-textarea mono-sm" id="txHex" readonly rows="4"></textarea>
           <div class="action-row">
-            <button class="btn btn-orange" onclick="broadcastTx()">⚡ Yayınla</button>
+            <button class="btn btn-orange" onclick="broadcastTx()">⚡ Onayla ve Yayınla</button>
             <button class="btn btn-ghost" onclick="copyTxHex()">⎘ Hex Kopyala</button>
           </div>
           <div id="broadcastResult" class="broadcast-result"></div>
@@ -1090,6 +1097,6 @@
   </div>
 
   <script src="/static/musig2d.js?v=20260402"></script>
-  <script src="/static/app.js?v=20260407e"></script>
+  <script src="/static/app.js?v=20260407f"></script>
 </body>
 </html>

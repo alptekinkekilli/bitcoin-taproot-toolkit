@@ -400,32 +400,73 @@ async function updateSendBalance() {
   const address = document.getElementById('sendFromSelect').value;
   const panel   = document.getElementById('sendUtxoPanel');
   const listEl  = document.getElementById('sendUtxoList');
+  const balEl   = document.getElementById('sendFromBalance');
+
   if (!address) {
-    document.getElementById('sendFromBalance').textContent = '';
+    if (balEl) balEl.textContent = '';
     if (panel) panel.style.display = 'none';
     return;
   }
 
-  // Bakiye
+  // Hangi cüzdana ait? Birincil mi yoksa HD alt-adres mi?
+  let ownerWallet  = null;
+  let isPrimary    = false;
+  for (const w of state.wallets) {
+    if (w.address === address) { ownerWallet = w; isPrimary = true; break; }
+    const hdAddrs = w.hd_addresses || {};
+    if (Object.values(hdAddrs).some(info => info.address === address)) {
+      ownerWallet = w; break;
+    }
+  }
+
+  // Bakiye göster
   try {
     const b = await get(`/api/wallet/${address}/balance`);
-    document.getElementById('sendFromBalance').textContent =
-      `Bakiye: ${b.confirmed_sat.toLocaleString()} sat (onaylanmış)`;
+    if (balEl) balEl.textContent = `Bakiye: ${b.confirmed_sat.toLocaleString()} sat (onaylanmış)`;
   } catch {}
 
-  // UTXO paneli
+  // UTXO paneli aç
   if (panel) panel.style.display = '';
   if (listEl) listEl.innerHTML = '<span style="color:var(--text-3)">UTXO\'lar yükleniyor…</span>';
 
   sendState.utxos    = [];
   sendState.selected = new Set();
+  sendState.ownerWallet = ownerWallet;
 
   try {
-    const utxos = await get(`/api/wallet/${address}/utxos`);
-    const confirmed = (utxos || []).filter(u => (u.confirmations || 0) >= 1);
-    // Smallest-first: küçük → büyük
-    confirmed.sort((a, b) => a.value - b.value);
-    sendState.utxos = confirmed;
+    // Hangi adresleri tarayacağız?
+    // Eğer birincil adres seçiliyse ve HD cüzdansa → tüm aktif alt-adresleri de tara
+    const targets = [];  // [{addr, label}]
+    if (ownerWallet && isPrimary && ownerWallet.hd) {
+      const hdAddrs = ownerWallet.hd_addresses || {};
+      const active  = Object.entries(hdAddrs).filter(([, info]) => info.balance_sat > 0 || info.utxo_count > 0);
+      if (active.length) {
+        // Birincil adres: index 0 veya doğrudan w.address
+        targets.push({ addr: ownerWallet.address, label: `${ownerWallet.label} (birincil)` });
+        active.forEach(([idx, info]) => targets.push({ addr: info.address, label: `${ownerWallet.label} [${idx}]` }));
+      } else {
+        targets.push({ addr: address, label: ownerWallet?.label || address.substring(0, 14) + '…' });
+      }
+    } else {
+      const subLabel = ownerWallet ? (() => {
+        const idx = Object.entries(ownerWallet.hd_addresses || {}).find(([, i]) => i.address === address)?.[0];
+        return idx ? `${ownerWallet.label} [${idx}]` : ownerWallet.label;
+      })() : address.substring(0, 14) + '…';
+      targets.push({ addr: address, label: subLabel });
+    }
+
+    // Paralel UTXO çekimi
+    const results = await Promise.all(targets.map(async t => {
+      try {
+        const utxos = await get(`/api/wallet/${t.addr}/utxos`);
+        return (utxos || []).filter(u => (u.confirmations || 0) >= 1)
+          .map(u => ({ ...u, _addr: t.addr, _label: t.label }));
+      } catch { return []; }
+    }));
+
+    let all = results.flat();
+    all.sort((a, b) => a.value - b.value);  // smallest-first
+    sendState.utxos = all;
 
     // Pre-seçim (quickSend ile geldi)
     if (sendState.preSelect) {
@@ -461,11 +502,13 @@ function _renderSendUtxoList() {
       : `${utxos.length} UTXO — Otomatik seçim (miktar yetene kadar)`;
   }
 
+  const multiAddr = new Set(utxos.map(u => u._addr)).size > 1;
   listEl.innerHTML = `
-    <div class="table-wrap" style="max-height:220px;overflow-y:auto">
+    <div class="table-wrap" style="max-height:260px;overflow-y:auto">
       <table class="data-table" style="font-size:12px">
         <thead><tr>
           <th style="width:24px"></th>
+          ${multiAddr ? '<th>Adres</th>' : ''}
           <th>TXID:vout</th>
           <th>Tutar</th>
           <th>Onay</th>
@@ -476,6 +519,7 @@ function _renderSendUtxoList() {
           const txShort = u.txid.substring(0, 16) + '…:' + u.vout;
           return `<tr style="cursor:pointer" onclick="sendToggleUtxo('${id}')">
             <td><input type="checkbox" ${chk} onclick="event.stopPropagation();sendToggleUtxo('${id}')"></td>
+            ${multiAddr ? `<td><span style="color:var(--text-3);font-size:11px">${u._label || ''}</span></td>` : ''}
             <td><span class="mono-xs">${txShort}</span></td>
             <td><span class="orange">${u.value.toLocaleString()} sat</span></td>
             <td>${u.confirmations >= 1 ? `<span class="badge badge-green">${u.confirmations}</span>` : '<span class="badge badge-yellow">0</span>'}</td>
@@ -524,7 +568,38 @@ async function buildTx() {
     document.getElementById('txSig').textContent = tx.signature.substring(0, 32) + '…';
     document.getElementById('txHex').value = tx.tx_hex;
     document.getElementById('txPreview').dataset.hex = tx.tx_hex;
-    toast('Transaction oluşturuldu', 'success');
+
+    // Kullanılan UTXO'ları önizlemede göster
+    const usedEl = document.getElementById('txUsedUtxoList');
+    if (usedEl && tx.used_utxos?.length) {
+      // Lokal state'teki UTXO'larla eşleştirip adres etiketini bul
+      const utxoMap = {};
+      sendState.utxos.forEach(u => { utxoMap[`${u.txid}:${u.vout}`] = u; });
+      const totalIn = tx.used_utxos.reduce((s, u) => s + u.value, 0);
+      usedEl.innerHTML = `
+        <div style="margin-bottom:6px;color:var(--text-2)">
+          ${tx.used_utxos.length} UTXO — Toplam giriş: <strong style="color:var(--orange)">${totalIn.toLocaleString()} sat</strong>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table" style="font-size:12px">
+            <thead><tr><th>TXID:vout</th><th>Adres</th><th>Tutar</th></tr></thead>
+            <tbody>${tx.used_utxos.map(u => {
+              const local = utxoMap[u.id];
+              const label = local?._label || '';
+              const short = u.txid.substring(0, 16) + '…:' + u.vout;
+              return `<tr>
+                <td><span class="mono-xs">${short}</span></td>
+                <td><span style="color:var(--text-3);font-size:11px">${label}</span></td>
+                <td><span class="orange">${u.value.toLocaleString()} sat</span></td>
+              </tr>`;
+            }).join('')}</tbody>
+          </table>
+        </div>`;
+    }
+
+    document.getElementById('broadcastResult').innerHTML = '';
+    document.getElementById('broadcastResult').className = 'broadcast-result';
+    toast('Transaction oluşturuldu — UTXO listesini kontrol edin, ardından Onayla ve Yayınla', 'success');
   } catch (e) {
     toast(e.message, 'error');
   }
@@ -1383,18 +1458,43 @@ async function createMusig2Session() {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function populateWalletSelects() {
-  const selects = ['receiveWalletSelect', 'sendFromSelect'];
-  selects.forEach(id => {
-    const el = document.getElementById(id);
-    if (!el) return;
-    const current = el.value;
+  // receiveWalletSelect — sadece birincil adresler
+  const recvEl = document.getElementById('receiveWalletSelect');
+  if (recvEl) {
+    const cur = recvEl.value;
     let opts = '<option value="">— Cüzdan seçin —</option>';
     state.wallets.forEach(w => {
       opts += `<option value="${w.address}">${w.label} — ${w.address.substring(0, 16)}…</option>`;
     });
-    el.innerHTML = opts;
-    if (current) el.value = current;
-  });
+    recvEl.innerHTML = opts;
+    if (cur) recvEl.value = cur;
+  }
+
+  // sendFromSelect — HD alt-adresler de dahil, cüzdan başına optgroup
+  const sendEl = document.getElementById('sendFromSelect');
+  if (sendEl) {
+    const cur = sendEl.value;
+    let opts = '<option value="">— Cüzdan seçin —</option>';
+    state.wallets.forEach(w => {
+      const hdAddrs = w.hd_addresses || {};
+      const activeHD = Object.entries(hdAddrs).filter(
+        ([, info]) => info.balance_sat > 0 || info.utxo_count > 0
+      );
+      if (activeHD.length) {
+        // HD cüzdan: optgroup ile birincil + alt-adresler
+        opts += `<optgroup label="── ${w.label}">`;
+        opts += `<option value="${w.address}">${w.label} (birincil) — ${w.address.substring(0, 16)}…</option>`;
+        activeHD.forEach(([idx, info]) => {
+          opts += `<option value="${info.address}">${w.label} [${idx}] — ${info.address.substring(0, 16)}… (${(info.balance_sat/1e8).toFixed(4)} BTC)</option>`;
+        });
+        opts += '</optgroup>';
+      } else {
+        opts += `<option value="${w.address}">${w.label} — ${w.address.substring(0, 16)}…</option>`;
+      }
+    });
+    sendEl.innerHTML = opts;
+    if (cur) sendEl.value = cur;
+  }
 }
 
 function quickReceive(address) {

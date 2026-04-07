@@ -176,6 +176,7 @@ class TaprootSigner:
         outputs: List[TxOutput],
         version: int = 2,
         locktime: int = 0,
+        sk_per_input: List[bytes] | None = None,
     ) -> Tuple[bytes, List[bytes]]:
         """
         Taproot transaction'ını imzalar.
@@ -225,7 +226,8 @@ class TaprootSigner:
                 version=version,
                 locktime=locktime,
             )
-            sig = schnorr_sign(sighash, sk)
+            input_sk = sk_per_input[idx] if sk_per_input else sk
+            sig = schnorr_sign(sighash, input_sk)
 
             # BIP-340 §Verification — imzayı hemen doğrula
             # Bu adım olmadan yanlış imza sessizce yayına girer.
