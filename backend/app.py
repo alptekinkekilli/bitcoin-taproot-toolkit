@@ -994,8 +994,8 @@ def get_balance(address: str):
 
 @app.get("/api/wallet/{address}/utxos")
 def get_wallet_utxos(address: str):
-    w = find_wallet(address)
-    network = w["network"] if w else "testnet"
+    w, _ = find_wallet_for_address(address)
+    network = w["network"] if w else "testnet4"
     mgr = get_utxo_manager(network)
     try:
         core_utxos = mgr.fetch_utxos(address)
@@ -1140,9 +1140,9 @@ def build_transaction(req: TxRequest):
             pinned  = [u for u in confirmed_utxos if f"{u.txid}:{u.vout}" in pinned_set]
             rest    = sorted(
                 [u for u in confirmed_utxos if f"{u.txid}:{u.vout}" not in pinned_set],
-                key=lambda u: u.value
+                key=lambda u: u.value_sat
             )
-            pinned_total = sum(u.value for u in pinned)
+            pinned_total = sum(u.value_sat for u in pinned)
             need = req.amount_sat + req.fee_sat
             if pinned_total >= need:
                 selected   = pinned
@@ -1199,7 +1199,7 @@ def build_transaction(req: TxRequest):
     # Hangi UTXO'ların kullanıldığını frontend'e bildir
     # (adres→label için frontend kendi eşleştirmesini yapar)
     used_utxos = [
-        {"txid": u.txid, "vout": u.vout, "value": u.value,
+        {"txid": u.txid, "vout": u.vout, "value": u.value_sat,
          "id": f"{u.txid}:{u.vout}"}
         for u in selected
     ]
