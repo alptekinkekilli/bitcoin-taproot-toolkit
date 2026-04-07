@@ -389,14 +389,116 @@ async function refreshReceive() {
 
 // ── Send ──────────────────────────────────────────────────────────────────────
 
+// Coin-control state
+const sendState = {
+  utxos: [],           // fetch edilmiş tüm onaylı UTXO'lar
+  selected: new Set(), // seçili "txid:vout" stringleri
+  preSelect: null,     // quickSend'den gelen pre-seçim
+};
+
 async function updateSendBalance() {
   const address = document.getElementById('sendFromSelect').value;
-  if (!address) { document.getElementById('sendFromBalance').textContent = ''; return; }
+  const panel   = document.getElementById('sendUtxoPanel');
+  const listEl  = document.getElementById('sendUtxoList');
+  if (!address) {
+    document.getElementById('sendFromBalance').textContent = '';
+    if (panel) panel.style.display = 'none';
+    return;
+  }
+
+  // Bakiye
   try {
     const b = await get(`/api/wallet/${address}/balance`);
     document.getElementById('sendFromBalance').textContent =
       `Bakiye: ${b.confirmed_sat.toLocaleString()} sat (onaylanmış)`;
   } catch {}
+
+  // UTXO paneli
+  if (panel) panel.style.display = '';
+  if (listEl) listEl.innerHTML = '<span style="color:var(--text-3)">UTXO\'lar yükleniyor…</span>';
+
+  sendState.utxos    = [];
+  sendState.selected = new Set();
+
+  try {
+    const utxos = await get(`/api/wallet/${address}/utxos`);
+    const confirmed = (utxos || []).filter(u => (u.confirmations || 0) >= 1);
+    // Smallest-first: küçük → büyük
+    confirmed.sort((a, b) => a.value - b.value);
+    sendState.utxos = confirmed;
+
+    // Pre-seçim (quickSend ile geldi)
+    if (sendState.preSelect) {
+      sendState.selected.add(sendState.preSelect);
+      sendState.preSelect = null;
+    }
+
+    _renderSendUtxoList();
+  } catch {
+    if (listEl) listEl.innerHTML = '<span style="color:#f85149">UTXO yüklenemedi.</span>';
+  }
+}
+
+function _renderSendUtxoList() {
+  const listEl   = document.getElementById('sendUtxoList');
+  const summaryEl = document.getElementById('sendUtxoSummary');
+  if (!listEl) return;
+
+  const utxos = sendState.utxos;
+  if (!utxos.length) {
+    listEl.innerHTML = '<span style="color:var(--text-3)">Onaylanmış UTXO bulunamadı.</span>';
+    if (summaryEl) summaryEl.textContent = '';
+    return;
+  }
+
+  const selTotal = utxos
+    .filter(u => sendState.selected.has(`${u.txid}:${u.vout}`))
+    .reduce((s, u) => s + u.value, 0);
+
+  if (summaryEl) {
+    summaryEl.textContent = sendState.selected.size
+      ? `${sendState.selected.size} seçili — ${selTotal.toLocaleString()} sat`
+      : `${utxos.length} UTXO — Otomatik seçim (miktar yetene kadar)`;
+  }
+
+  listEl.innerHTML = `
+    <div class="table-wrap" style="max-height:220px;overflow-y:auto">
+      <table class="data-table" style="font-size:12px">
+        <thead><tr>
+          <th style="width:24px"></th>
+          <th>TXID:vout</th>
+          <th>Tutar</th>
+          <th>Onay</th>
+        </tr></thead>
+        <tbody>${utxos.map(u => {
+          const id  = `${u.txid}:${u.vout}`;
+          const chk = sendState.selected.has(id) ? 'checked' : '';
+          const txShort = u.txid.substring(0, 16) + '…:' + u.vout;
+          return `<tr style="cursor:pointer" onclick="sendToggleUtxo('${id}')">
+            <td><input type="checkbox" ${chk} onclick="event.stopPropagation();sendToggleUtxo('${id}')"></td>
+            <td><span class="mono-xs">${txShort}</span></td>
+            <td><span class="orange">${u.value.toLocaleString()} sat</span></td>
+            <td>${u.confirmations >= 1 ? `<span class="badge badge-green">${u.confirmations}</span>` : '<span class="badge badge-yellow">0</span>'}</td>
+          </tr>`;
+        }).join('')}</tbody>
+      </table>
+    </div>`;
+}
+
+function sendToggleUtxo(id) {
+  if (sendState.selected.has(id)) sendState.selected.delete(id);
+  else sendState.selected.add(id);
+  _renderSendUtxoList();
+}
+
+function sendSelectAllUtxos() {
+  sendState.utxos.forEach(u => sendState.selected.add(`${u.txid}:${u.vout}`));
+  _renderSendUtxoList();
+}
+
+function sendClearUtxoSel() {
+  sendState.selected.clear();
+  _renderSendUtxoList();
 }
 
 async function buildTx() {
@@ -409,11 +511,11 @@ async function buildTx() {
   if (!to)     return toast('Alıcı adresi girin', 'error');
   if (!amount || amount < 546) return toast('Miktar en az 546 sat olmalı', 'error');
 
+  const body = { from_address: from, to_address: to, amount_sat: amount, fee_sat: fee };
+  if (sendState.selected.size > 0) body.utxo_ids = [...sendState.selected];
+
   try {
-    const tx = await post('/api/tx/build', {
-      from_address: from, to_address: to,
-      amount_sat: amount, fee_sat: fee,
-    });
+    const tx = await post('/api/tx/build', body);
 
     document.getElementById('txPreview').style.display = 'block';
     document.getElementById('txSize').textContent = `${tx.tx_size} bayt`;
@@ -421,8 +523,6 @@ async function buildTx() {
     document.getElementById('txChange').textContent = tx.change_sat > 0 ? `${tx.change_sat.toLocaleString()} sat` : '—';
     document.getElementById('txSig').textContent = tx.signature.substring(0, 32) + '…';
     document.getElementById('txHex').value = tx.tx_hex;
-
-    // Store hex for broadcast
     document.getElementById('txPreview').dataset.hex = tx.tx_hex;
     toast('Transaction oluşturuldu', 'success');
   } catch (e) {
@@ -651,12 +751,16 @@ async function _txwUtxoPanel(filterAddr) {
         <button class="btn btn-ghost sm" style="margin-left:12px" onclick="quickSend('${filterAddr}')">Bu adresten gönder →</button>
       </div>
       <div class="table-wrap"><table class="data-table" style="font-size:12px">
-        <thead><tr><th>TXID:vout</th><th>Tutar</th><th>Onay</th></tr></thead>
-        <tbody>${utxos.map(u => `<tr>
-          <td><span class="mono-xs">${u.txid ? u.txid.substring(0,16) + '…:' + u.vout : '—'}</span></td>
-          <td><span class="orange">${(u.value||0).toLocaleString()} sat</span></td>
-          <td>${u.confirmations >= 1 ? `<span class="badge badge-green">${u.confirmations}</span>` : '<span class="badge badge-yellow">0</span>'}</td>
-        </tr>`).join('')}</tbody>
+        <thead><tr><th>TXID:vout</th><th>Tutar</th><th>Onay</th><th></th></tr></thead>
+        <tbody>${utxos.map(u => {
+          const id = `${u.txid}:${u.vout}`;
+          return `<tr>
+            <td><span class="mono-xs">${u.txid ? u.txid.substring(0,16) + '…:' + u.vout : '—'}</span></td>
+            <td><span class="orange">${(u.value||0).toLocaleString()} sat</span></td>
+            <td>${u.confirmations >= 1 ? `<span class="badge badge-green">${u.confirmations}</span>` : '<span class="badge badge-yellow">0</span>'}</td>
+            <td><button class="btn btn-ghost sm" style="padding:2px 6px;font-size:10px" onclick="quickSend('${filterAddr}','${id}')">Gönder →</button></td>
+          </tr>`;
+        }).join('')}</tbody>
       </table></div>`;
   } catch {
     panel.innerHTML = '<div style="color:#f85149;font-size:12px">UTXO yüklenemedi.</div>';
@@ -1142,13 +1246,13 @@ function _renderHDBody(walletId) {
 // ── HD Cüzdan Tarama ──────────────────────────────────────────────────────────
 
 async function hdScanWallet(walletId) {
-  const panel = document.getElementById(`wallet-hd-panel-${walletId}`);
-  const body  = document.getElementById(`wallet-hd-body-${walletId}`);
-  const key   = `wallets-${walletId}`;
+  const panel  = document.getElementById(`wallet-hd-panel-${walletId}`);
+  const body   = document.getElementById(`wallet-hd-body-${walletId}`);
+  const scanBtn = document.querySelector(`button[onclick="hdScanWallet('${walletId}')"]`);
+  const key    = `wallets-${walletId}`;
 
   // Toggle: zaten açık ve veri varsa kapat
   if (panel && panel.style.display !== 'none' && state.hdScanResults[walletId]) {
-    // Yenile butonundan çağrıldıysa devam et, toggle değil
     const isCalled = arguments[1] === 'refresh';
     if (!isCalled) {
       state.hdPanelOpen[key] = false;
@@ -1157,21 +1261,25 @@ async function hdScanWallet(walletId) {
     }
   }
 
-  // Panel'i aç
+  // Loading state
   state.hdPanelOpen[key] = true;
   if (panel) panel.style.display = '';
-  if (body)  body.innerHTML = '<div style="color:var(--text-3);font-size:13px;padding:8px 0">Adresler taranıyor… lütfen bekleyin.</div>';
+  if (body)  body.innerHTML = '<div style="color:var(--text-3);font-size:13px;padding:8px 0">⏳ Adresler taranıyor… lütfen bekleyin.</div>';
+  if (scanBtn) { scanBtn.disabled = true; scanBtn.textContent = '⏳ Taranıyor…'; }
 
   try {
     const res = await post(`/api/wallet/${walletId}/hd-scan`, {});
-    // 1A: Sonucu state'e kaydet
     state.hdScanResults[walletId] = res;
     if (body) body.innerHTML = _renderHDBody(walletId);
     populateWalletSelects();
-    // Dashboard'u da güncelle (bakiyeler değişmiş olabilir)
     _renderDashboardAddressTable();
   } catch(e) {
     if (body) body.innerHTML = `<div style="color:#f85149;font-size:13px">Tarama hatası: ${e.message}</div>`;
+  } finally {
+    // scanBtn artık _renderHDBody içindeki "Yenile" butonu — satır yeniden render edildi,
+    // dıştaki buton ise DOM'da kalmış olabilir, onu da sıfırla
+    const btn = document.querySelector(`button[onclick="hdScanWallet('${walletId}')"]`);
+    if (btn) { btn.disabled = false; btn.textContent = '⟳ HD Tara'; }
   }
 }
 
@@ -1295,8 +1403,9 @@ function quickReceive(address) {
   updateReceive();
 }
 
-function quickSend(address) {
+function quickSend(address, utxoId) {
   document.getElementById('sendFromSelect').value = address;
+  if (utxoId) sendState.preSelect = utxoId;
   showTab('send');
   updateSendBalance();
 }

@@ -206,6 +206,7 @@ class TxRequest(BaseModel):
     to_address: str
     amount_sat: int
     fee_sat: int = 500
+    utxo_ids: list[str] | None = None  # ["txid:vout", …] — coin control
 
 class BroadcastRequest(BaseModel):
     tx_hex: str
@@ -1091,11 +1092,30 @@ def build_transaction(req: TxRequest):
     except ValueError as exc:
         raise HTTPException(400, f"Alıcı adres hatalı: {exc}")
 
-    # ── Coin Selection (smallest-first) ──────────────────────────────────────
+    # ── Coin Selection ────────────────────────────────────────────────────────
+    # Kullanıcı belirli UTXO'lar seçmişse (coin control) önce onları ekle;
+    # toplam yetmezse smallest-first ile geri kalanlardan tamamla.
     try:
-        selected, change_sat = CoinSelector.smallest_first(
-            confirmed_utxos, req.amount_sat, req.fee_sat
-        )
+        if req.utxo_ids:
+            pinned_set = set(req.utxo_ids)
+            pinned  = [u for u in confirmed_utxos if f"{u.txid}:{u.vout}" in pinned_set]
+            rest    = [u for u in confirmed_utxos if f"{u.txid}:{u.vout}" not in pinned_set]
+            pinned_total = sum(u.value for u in pinned)
+            need = req.amount_sat + req.fee_sat
+            if pinned_total >= need:
+                selected  = pinned
+                change_sat = pinned_total - need
+            else:
+                # Pinned yetmedi — smallest-first ile kalan UTXO'lardan tamamla
+                extra, extra_change = CoinSelector.smallest_first(
+                    rest, need - pinned_total, 0
+                )
+                selected   = pinned + extra
+                change_sat = extra_change
+        else:
+            selected, change_sat = CoinSelector.smallest_first(
+                confirmed_utxos, req.amount_sat, req.fee_sat
+            )
     except ValueError as e:
         raise HTTPException(400, str(e))
 

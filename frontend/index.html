@@ -145,7 +145,19 @@
               <input class="form-input" id="sendFee" type="number" value="500" min="100">
             </div>
           </div>
-          <div class="action-row">
+
+          <!-- UTXO Seçim Paneli -->
+          <div id="sendUtxoPanel" style="display:none;margin-top:16px">
+            <div style="display:flex;align-items:center;gap:12px;margin-bottom:8px">
+              <span class="form-label" style="margin:0">UTXO Seçimi</span>
+              <span id="sendUtxoSummary" style="font-size:12px;color:var(--text-3)"></span>
+              <button class="btn btn-ghost sm" onclick="sendSelectAllUtxos()" style="margin-left:auto">Tümünü Seç</button>
+              <button class="btn btn-ghost sm" onclick="sendClearUtxoSel()">Temizle</button>
+            </div>
+            <div id="sendUtxoList" style="font-size:12px;color:var(--text-3)">Yükleniyor…</div>
+          </div>
+
+          <div class="action-row" style="margin-top:16px">
             <button class="btn btn-primary" onclick="buildTx()">Transaction Oluştur</button>
           </div>
         </div>
@@ -1078,6 +1090,6 @@
   </div>
 
   <script src="/static/musig2d.js?v=20260402"></script>
-  <script src="/static/app.js?v=20260407d"></script>
+  <script src="/static/app.js?v=20260407e"></script>
 </body>
 </html>
