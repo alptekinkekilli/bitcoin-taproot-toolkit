@@ -315,30 +315,51 @@ async function loadRecentTxs() {
   const tbody = document.getElementById('recentTxTable');
   let allTxs = [];
 
-  for (const w of state.wallets.slice(0, 3)) {
-    try {
-      const txs = await get(`/api/wallet/${w.address}/txs`);
-      allTxs = allTxs.concat(txs.slice(0, 3).map(t => ({ ...t, _wallet: w.label })));
-    } catch {}
+  // Birincil adresler + tüm bilinen HD sub-adresler
+  const targets = [];
+  for (const w of state.wallets) {
+    targets.push({ addr: w.address, label: w.label, network: w.network });
+    Object.entries(w.hd_addresses || {}).forEach(([idx, info]) => {
+      if (info.address && info.address !== w.address)
+        targets.push({ addr: info.address, label: `${w.label} [${idx}]`, network: w.network });
+    });
   }
 
-  allTxs.sort((a, b) => (b.status?.block_time || 0) - (a.status?.block_time || 0));
+  await Promise.all(targets.map(async t => {
+    try {
+      const txs = await get(`/api/wallet/${t.addr}/txs`);
+      txs.slice(0, 5).forEach(tx => allTxs.push({ ...tx, _wallet: t.label, _network: t.network }));
+    } catch {}
+  }));
+
+  // Unconfirmed en üste (block_time yoksa Infinity gibi davran)
+  const sortKey = tx => tx.status?.confirmed ? (tx.status?.block_time || 0) : Infinity;
+  allTxs.sort((a, b) => sortKey(b) - sortKey(a));
+
+  // Deduplicate by txid
+  const seen = new Set();
+  allTxs = allTxs.filter(tx => { if (seen.has(tx.txid)) return false; seen.add(tx.txid); return true; });
 
   if (!allTxs.length) {
     tbody.innerHTML = '<tr><td colspan="4" class="empty">İşlem yok</td></tr>';
     return;
   }
 
-  tbody.innerHTML = allTxs.slice(0, 8).map(tx => `
-    <tr>
-      <td><span class="mono-sm truncate">${tx.txid}</span></td>
-      <td>${tx.status?.block_height ? `#${tx.status.block_height}` : '—'}</td>
-      <td>${statusBadge(tx.status?.confirmed)}</td>
+  const explorerBase = n => n === 'mainnet' ? 'https://mempool.space' : 'https://mempool.space/testnet4';
+  tbody.innerHTML = allTxs.slice(0, 10).map(tx => {
+    const outSum = tx.vout?.reduce((s, o) => s + o.value, 0) || 0;
+    return `<tr>
       <td>
-        <a class="link mono-sm" href="https://mempool.space/testnet4/tx/${tx.txid}" target="_blank">↗</a>
+        <span class="bold" style="font-size:11px;color:var(--text-3)">${tx._wallet}</span><br>
+        <span class="mono-xs">${tx.txid.substring(0, 20)}…</span>
+        <button class="btn btn-ghost sm" style="padding:1px 4px;font-size:10px" onclick="copyToClipboard('${tx.txid}');toast('TXID kopyalandı','success')">⎘</button>
       </td>
-    </tr>
-  `).join('');
+      <td>${tx.status?.block_height ? `#${tx.status.block_height}` : '<span style="color:var(--text-3)">Mempool</span>'}</td>
+      <td><span class="orange" style="font-size:12px">${outSum.toLocaleString()} sat</span></td>
+      <td>${statusBadge(tx.status?.confirmed)}</td>
+      <td><a class="link" href="${explorerBase(tx._network)}/tx/${tx.txid}" target="_blank">↗</a></td>
+    </tr>`;
+  }).join('');
 }
 
 // ── Receive ───────────────────────────────────────────────────────────────────
@@ -734,7 +755,12 @@ async function txwLoad() {
   // Deduplicate
   const seen = new Set();
   allTxs = allTxs.filter(tx => { if (seen.has(tx.txid)) return false; seen.add(tx.txid); return true; });
-  allTxs.sort((a, b) => (b.status?.block_time || 0) - (a.status?.block_time || 0));
+  // Unconfirmed TX'ler en üste (block_time yoksa Infinity gibi davran)
+  allTxs.sort((a, b) => {
+    const ta = a.status?.confirmed ? (a.status?.block_time || 0) : Infinity;
+    const tb = b.status?.confirmed ? (b.status?.block_time || 0) : Infinity;
+    return tb - ta;
+  });
 
   txState.wTxs = allTxs;
   txState.wPage = 1;
