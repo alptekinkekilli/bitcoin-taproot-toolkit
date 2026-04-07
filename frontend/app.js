@@ -47,7 +47,8 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   loadAll();
-  setInterval(() => { if (state.autoRefresh) refreshAll(); }, 30000);
+  // 60s'de bir sadece bakiye + cüzdan listesi yenile (TX geçmişi dahil değil)
+  setInterval(() => { if (state.autoRefresh) refreshAll(); }, 60000);
 });
 
 // ── Navigation ────────────────────────────────────────────────────────────────
@@ -180,13 +181,17 @@ async function refreshDashboard() {
     } catch { return null; }
   });
 
-  // HD alt adresler için de bakiye çek (state.hdScanResults'ta kayıtlı olanlar)
+  // HD alt adresler için bakiye çek — sadece daha önce bakiyesi olan veya
+  // henüz hiç sorgulanmamış adresler (her döngüde 46 istek atmaktan kaçın)
   const hdFetches = [];
   state.wallets.forEach(w => {
     const scan = state.hdScanResults[w.id];
     if (!scan) return;
     scan.addresses.forEach(a => {
       if (!a.address || a.address === w.address) return;
+      // Bakiyesi sıfır ve daha önce sorgulanmışsa yeniden sorgulamaya gerek yok
+      const cached = state.balances[a.address];
+      if (cached && cached.total_sat === 0 && cached.utxo_count === 0) return;
       hdFetches.push(get(`/api/wallet/${a.address}/balance`).then(b => {
         state.balances[a.address] = b;
         a.balance_sat = b.total_sat;
@@ -315,12 +320,18 @@ async function loadRecentTxs() {
   const tbody = document.getElementById('recentTxTable');
   let allTxs = [];
 
-  // Birincil adresler + tüm bilinen HD sub-adresler
+  // Birincil adresler + bakiyesi OLAN veya harcama yaşamış HD sub-adresler
+  // (bakiyesi sıfır ve hiç TX geçmişi olmayan adresleri dashboard'a yükleme)
   const targets = [];
   for (const w of state.wallets) {
     targets.push({ addr: w.address, label: w.label, network: w.network });
     Object.entries(w.hd_addresses || {}).forEach(([idx, info]) => {
-      if (info.address && info.address !== w.address)
+      if (!info.address || info.address === w.address) return;
+      // Bakiyesi olan VEYA daha önce funded olmuş (balance=0 ama tx geçmişi var)
+      const hadActivity = (info.balance_sat || 0) > 0 || (info.utxo_count || 0) > 0
+        || state.balances[info.address]?.total_sat > 0
+        || (state.balances[info.address] === undefined);  // ilk açılışta tümünü bir kez çek
+      if (hadActivity)
         targets.push({ addr: info.address, label: `${w.label} [${idx}]`, network: w.network });
     });
   }
@@ -721,15 +732,20 @@ async function txwLoad() {
   if (tbody) tbody.innerHTML = '<tr><td colspan="7" class="empty">Yükleniyor…</td></tr>';
 
   // Hangi adresleri tarayacağız?
-  // TX geçmişi için harcanmış adresler de dahil — balance=0 olsa bile tara.
+  // TX geçmişi — bakiyesi olan veya daha önce aktif olmuş adresler.
+  // Hiç faaliyeti olmayan gap-limit adresleri taranmaz (gereksiz Esplora istekleri önlenir).
   let targets = [];
   if (!filterAddr) {
     state.wallets.forEach(w => {
       targets.push({ addr: w.address, label: w.label, network: w.network });
       const hdAddrs = w.hd_addresses || {};
       Object.entries(hdAddrs).forEach(([idx, info]) => {
-        // TX geçmişi: bakiyesi olmayan (harcanmış) adresler de dahil
-        if (info.address && info.address !== w.address)
+        if (!info.address || info.address === w.address) return;
+        // Aktif adres: bakiyesi > 0, UTXO'su var veya geçmişte balance çekilmiş (cached)
+        const active = (info.balance_sat || 0) > 0
+          || (info.utxo_count || 0) > 0
+          || (state.balances[info.address]?.total_sat ?? -1) >= 0;
+        if (active)
           targets.push({ addr: info.address, label: `${w.label} [${idx}]`, network: w.network });
       });
     });
