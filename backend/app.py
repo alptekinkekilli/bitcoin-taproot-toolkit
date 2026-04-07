@@ -1019,10 +1019,16 @@ def get_wallet_utxos(address: str):
 @app.get("/api/wallet/{address}/txs")
 def get_wallet_txs(address: str):
     import urllib.request, json
-    w = find_wallet(address)
+    w, _ = find_wallet_for_address(address)
     if not w:
-        raise HTTPException(404, "Cüzdan bulunamadı")
-    base = esplora_base(w["network"])
+        # HD sub-adres veya MuSig2 adresi — ağı adres prefix'inden tahmin et
+        if address.startswith("bc1"):
+            network = "mainnet"
+        else:
+            network = "testnet4"
+    else:
+        network = w["network"]
+    base = esplora_base(network)
     url = f"{base}/address/{address}/txs"
     try:
         with urllib.request.urlopen(url, timeout=10) as r:

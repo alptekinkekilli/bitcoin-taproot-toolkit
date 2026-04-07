@@ -555,6 +555,9 @@ async function buildTx() {
   if (!to)     return toast('Alıcı adresi girin', 'error');
   if (!amount || amount < 546) return toast('Miktar en az 546 sat olmalı', 'error');
 
+  const buildBtn = document.querySelector('button[onclick="buildTx()"]');
+  if (buildBtn) { buildBtn.disabled = true; buildBtn.textContent = '⏳ Lütfen bekleyin…'; }
+
   const body = { from_address: from, to_address: to, amount_sat: amount, fee_sat: fee };
   if (sendState.selected.size > 0) body.utxo_ids = [...sendState.selected];
 
@@ -564,6 +567,7 @@ async function buildTx() {
     document.getElementById('txPreview').style.display = 'block';
     document.getElementById('txSize').textContent = `${tx.tx_size} bayt`;
     document.getElementById('txFee').textContent = `${tx.fee_sat.toLocaleString()} sat`;
+    document.getElementById('txSendAmount').textContent = `${amount.toLocaleString()} sat`;
     document.getElementById('txChange').textContent = tx.change_sat > 0 ? `${tx.change_sat.toLocaleString()} sat` : '—';
     document.getElementById('txSig').textContent = tx.signature.substring(0, 32) + '…';
     document.getElementById('txHex').value = tx.tx_hex;
@@ -602,6 +606,8 @@ async function buildTx() {
     toast('Transaction oluşturuldu — UTXO listesini kontrol edin, ardından Onayla ve Yayınla', 'success');
   } catch (e) {
     toast(e.message, 'error');
+  } finally {
+    if (buildBtn) { buildBtn.disabled = false; buildBtn.textContent = 'Transaction Oluştur'; }
   }
 }
 
@@ -694,13 +700,15 @@ async function txwLoad() {
   if (tbody) tbody.innerHTML = '<tr><td colspan="7" class="empty">Yükleniyor…</td></tr>';
 
   // Hangi adresleri tarayacağız?
+  // TX geçmişi için harcanmış adresler de dahil — balance=0 olsa bile tara.
   let targets = [];
   if (!filterAddr) {
     state.wallets.forEach(w => {
       targets.push({ addr: w.address, label: w.label, network: w.network });
       const hdAddrs = w.hd_addresses || {};
       Object.entries(hdAddrs).forEach(([idx, info]) => {
-        if (info.balance_sat > 0 || info.utxo_count > 0)
+        // TX geçmişi: bakiyesi olmayan (harcanmış) adresler de dahil
+        if (info.address && info.address !== w.address)
           targets.push({ addr: info.address, label: `${w.label} [${idx}]`, network: w.network });
       });
     });
