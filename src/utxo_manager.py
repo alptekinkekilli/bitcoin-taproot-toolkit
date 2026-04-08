@@ -53,7 +53,9 @@ BIP-141 vByte Hesabı (Taproot):
 """
 
 import json
+import logging
 import struct
+import threading
 import urllib.request
 import urllib.error
 from dataclasses import dataclass, field
@@ -64,6 +66,18 @@ import os
 # raw_tx.UTXO ile uyumluluk için aynı interface
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'btc_examples'))
 from raw_tx import UTXO, TxOutput
+
+logger = logging.getLogger(__name__)
+
+# Bitcoin Core yalnızca tek bir scantxoutset işlemine izin verir.
+# Paralel çağrılar -8 hatası verir. Bu lock sıralı çalışmayı garantiler.
+_scantxoutset_lock = threading.Lock()
+
+# LOG_LEVEL=full → DEBUG (HTTP istekleri görünür), diğer modlarda WARNING
+_LOG_LEVEL_MAP = {"min": logging.WARNING, "semi": logging.INFO, "full": logging.DEBUG}
+_http_log_level = _LOG_LEVEL_MAP.get(os.environ.get("LOG_LEVEL", "semi").lower(), logging.INFO)
+# semi ve min modda HTTP sorgu logları WARNING seviyesine çekilir (gizlenir)
+_http_log_level = logging.DEBUG if _http_log_level <= logging.DEBUG else logging.WARNING
 
 
 # ── P2TR Script Sabitleri ─────────────────────────────────────────────────────
@@ -270,11 +284,11 @@ class UTXOManager:
             try:
                 return self._fetch_from_core_listunspent(address)
             except Exception as e:
-                print(f"  [UYARI] listunspent başarısız ({e}), scantxoutset deneniyor...")
+                logger.warning("[Core] listunspent başarısız (%s), scantxoutset deneniyor...", e)
                 try:
                     return self._fetch_from_core_scan(address)
                 except Exception as e2:
-                    print(f"  [UYARI] scantxoutset başarısız ({e2}), Esplora'ya geçiliyor...")
+                    logger.warning("[Core] scantxoutset başarısız (%s), Esplora'ya geçiliyor...", e2)
 
         return self._fetch_from_esplora(address)
 
@@ -298,13 +312,14 @@ class UTXOManager:
 
         Descriptor formatı: addr(tb1p...) veya tr(xonly_hex)
         addr() formatı daha basit ama tr() daha verimli indeksler.
+
+        Bitcoin Core yalnızca tek bir eşzamanlı scantxoutset işlemine izin verir.
+        _scantxoutset_lock ile paralel çağrılar sıralanır.
         """
-        # addr() descriptor — Core adres tipini otomatik algılar
-        from .descriptor_wallet import DescriptorChecksum
-        # addr() için checksum gerekmez ama Core bunu kabul eder
         scan_desc = f"addr({address})"
 
-        result = self.rpc.scan_tx_out_set([scan_desc])
+        with _scantxoutset_lock:
+            result = self.rpc.scan_tx_out_set([scan_desc])
         if not result or not result.get("success"):
             return []
 
@@ -343,6 +358,7 @@ class UTXOManager:
             raise RuntimeError(f"{self.network} için Esplora URL'i tanımlı değil")
 
         url = f"{self._esplora_base}/address/{address}/utxo"
+        logger.log(_http_log_level, "[Esplora] GET %s", url)
         try:
             with urllib.request.urlopen(url, timeout=10) as r:
                 raw = json.loads(r.read())
@@ -385,6 +401,7 @@ class UTXOManager:
         if not self._esplora_base:
             return None
         url = f"{self._esplora_base}/tx/{txid}"
+        logger.log(_http_log_level, "[Esplora] GET %s (vout=%d)", url, vout)
         try:
             with urllib.request.urlopen(url, timeout=10) as r:
                 tx = json.loads(r.read())

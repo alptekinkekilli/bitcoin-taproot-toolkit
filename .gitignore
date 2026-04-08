@@ -24,14 +24,18 @@ dist/
 *.log
 logs/
 
-# Environment & secrets
+# Environment & secrets — hiçbir .env.* commit edilmez (credential içerir)
 .env
 .env.*
 !.env.example
+backend/.env.*
+!backend/.env.example
 
-# Data (session store — local only)
-backend/data/dmusig2_sessions.json
-backend/data/*.json
+# Data — cüzdan, oturum, descriptor dosyaları local only
+backend/data/
+
+# Kök dizindeki test/descriptor dosyaları
+*.descriptor
 
 # OS
 .DS_Store

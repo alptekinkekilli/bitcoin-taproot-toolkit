@@ -53,8 +53,13 @@ from src.descriptor_wallet import DescriptorWallet, DescriptorChecksum
 from src.utxo_manager import UTXOManager, CoreUTXO, CoinSelector, build_p2tr_scriptpubkey, parse_p2tr_scriptpubkey
 from src.taproot_signer import TaprootSigner, SighashType
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+# LOG_LEVEL: min=WARNING, semi=INFO (default), full=DEBUG
+_LOG_LEVEL_MAP = {"min": logging.WARNING, "semi": logging.INFO, "full": logging.DEBUG}
+_LOG_LEVEL = _LOG_LEVEL_MAP.get(os.environ.get("LOG_LEVEL", "semi").lower(), logging.INFO)
+logging.basicConfig(level=_LOG_LEVEL, format="%(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
+# Esplora/HTTP istek logları: 'full' modda DEBUG, diğerlerinde WARNING
+_esplora_log = logging.WARNING if _LOG_LEVEL > logging.DEBUG else logging.DEBUG
 
 app = FastAPI(title="Taproot Wallet API", version="1.0.0")
 
@@ -76,11 +81,15 @@ _core_rpc: Optional[CoreConnector] = None
 
 if _USE_CORE:
     try:
+        _rpc_port = int(os.environ["BITCOIN_RPCPORT"]) if os.environ.get("BITCOIN_RPCPORT") else None
         _core_rpc = CoreConnector(
             network=os.environ.get("BITCOIN_NETWORK", "testnet"),
-            rpcuser=os.environ.get("BITCOIN_RPCUSER"),
-            rpcpassword=os.environ.get("BITCOIN_RPCPASSWORD"),
+            rpcuser=os.environ.get("BITCOIN_RPCUSER") or None,
+            rpcpassword=os.environ.get("BITCOIN_RPCPASSWORD") or None,
+            rpchost=os.environ.get("BITCOIN_RPCHOST", "127.0.0.1"),
+            rpcport=_rpc_port,
             wallet_name=os.environ.get("BITCOIN_WALLET"),
+            cookie_path=os.environ.get("BITCOIN_COOKIE_PATH") or None,
         )
         info = _core_rpc.health_check()
         logger.info("[Core] Bitcoin Core v26+ bağlandı: chain=%s blocks=%s progress=%.4f",
@@ -667,60 +676,127 @@ def wallet_public(w: Dict) -> Dict:
 
 # ── Wallet Endpoints ──────────────────────────────────────────────────────────
 
+def _core_list_descriptors() -> set:
+    """Core cüzdanındaki mevcut descriptor'ların xpub/tpub'larını döner."""
+    try:
+        result = _core_rpc.call("listdescriptors")
+        import re
+        tpubs = set()
+        for d in result.get("descriptors", []):
+            m = re.search(r'((?:xpub|tpub)[A-Za-z0-9]+)', d.get("desc", ""))
+            if m:
+                tpubs.add(m.group(1))
+        return tpubs
+    except Exception:
+        return set()
+
+
+def _core_import_hd_wallet(wallet: Dict) -> Dict:
+    """
+    HD cüzdanı Bitcoin Core'a BIP-86 range descriptor ile import eder.
+    Zaten mevcut olan descriptor'lar atlanır.
+
+    Yeni cüzdan → timestamp=now (geçmiş tarama yok, hızlı).
+    Import edilmiş cüzdan → timestamp=0 (genesis'ten tara, geçmiş TX görünür).
+    """
+    if not _core_rpc:
+        return {}
+
+    testnet = wallet["network"] != "mainnet"
+    master_kv = _wallet_master_kv(wallet)
+    timestamp = 0 if wallet.get("hd_imported") else int(_time.time())
+
+    try:
+        descriptor, _ = make_sparrow_descriptor(
+            sk_hex=wallet["sk_hex"] if not wallet.get("hd_imported") else None,
+            testnet=testnet,
+            master_kv=master_kv,
+        )
+        desc_base = descriptor.split("#")[0]
+        recv_desc   = descsum_create(desc_base.replace("<0;1>", "0"))
+        change_desc = descsum_create(desc_base.replace("<0;1>", "1"))
+
+        # Bu descriptor'ın xpub/tpub'ını çıkar
+        import re
+        m = re.search(r'((?:xpub|tpub)[A-Za-z0-9]+)', recv_desc)
+        our_tpub = m.group(1) if m else None
+
+        # Core'da zaten varsa atla
+        if our_tpub and our_tpub in _core_list_descriptors():
+            logger.info("[Core] Descriptor zaten mevcut, atlandı: %s", wallet["label"])
+            return {"skipped": True, "reason": "Descriptor zaten Core'da mevcut"}
+
+        requests = [
+            {"desc": recv_desc,   "timestamp": timestamp, "range": [0, 999],
+             "watchonly": True, "label": wallet["label"], "active": True},
+            {"desc": change_desc, "timestamp": timestamp, "range": [0, 999],
+             "watchonly": True, "label": wallet["label"] + " (change)", "active": True},
+        ]
+        results = _core_rpc.import_descriptors(requests)
+
+        errors = [r for r in results if not r.get("success")]
+        if errors:
+            logger.warning("[Core] importdescriptors kısmi hata: %s", errors)
+            return {"warning": str(errors)}
+
+        logger.info("[Core] HD cüzdan import edildi: %s (timestamp=%s)", wallet["label"], timestamp)
+        return {"success": True, "descriptors": [recv_desc[:40] + "…", change_desc[:40] + "…"]}
+
+    except Exception as e:
+        logger.warning("[Core] HD wallet import başarısız: %s", e)
+        return {"warning": str(e)}
+
+
+def _generate_wallet_addresses(wallet: Dict, n: int = 20):
+    """
+    Wallet oluşturulduğunda n adet receive + n adet change adresi türetir.
+    Esplora sorgusu yapılmaz; balance/utxo_count başlangıçta 0'dır.
+    hd_addresses (change=0) ve hd_change_addresses (change=1) olarak kaydeder.
+    """
+    testnet = wallet["network"] != "mainnet"
+    seed_sk = bytes.fromhex(wallet["sk_hex"]) if not wallet.get("hd_imported") else None
+    master_kv = _wallet_master_kv(wallet)
+
+    def _derive(change: int) -> Dict[str, Dict]:
+        result = {}
+        for i in range(n):
+            _, xonly, address = _hd_child_at_index(seed_sk, testnet, change=change, index=i, master_kv=master_kv)
+            result[str(i)] = {"address": address, "xonly_pk": xonly.hex(), "balance_sat": 0, "utxo_count": 0}
+        return result
+
+    wallet["hd_addresses"] = _derive(0)
+    wallet["hd_change_addresses"] = _derive(1)
+
+
 @app.post("/api/wallet/new")
 def create_wallet(req: WalletCreate):
     """
-    Yeni Taproot cüzdanı oluştur.
+    Yeni Taproot cüzdanı oluştur ve Bitcoin Core'a BIP-86 range descriptor ile ekle.
 
-    Bitcoin Core v26+ aktifse:
-        1. tr(xonly_hex)#checksum descriptor oluştur
-        2. importdescriptors ile Core cüzdanına izleme adresi olarak ekle
-        3. Sonraki listunspent çağrısında adres tanınır
-
-    importprivkey kullanılmaz — descriptor wallet zorunlu (v26+ kısıtı).
+    Core aktifse tr([fp/86h/coinh/0h]xpub/0/*) + tr(.../1/*) descriptor çifti
+    importdescriptors ile yüklenir — tüm HD adresler otomatik izlenir.
     """
     seed_sk = sec_mod.token_bytes(32)
     testnet = req.network in ("testnet", "testnet4")
-    # BIP-86 HD: m/86'/coin_type'/0'/0/0 → BIP-341 tweak → adres
-    # Sparrow descriptor'ının ilk receive adresiyle eşleşir.
     _child_sk, xonly_pk, address = _hd_child_for_address(seed_sk, testnet)
 
     wallet = {
         "id": str(uuid.uuid4())[:8],
         "label": req.label,
-        "sk_hex": seed_sk.hex(),      # root seed (HD türetme için)
-        "xonly_pk": xonly_pk.hex(),   # m/86'/…/0'/0/0 internal key
-        "address": address,            # HD child BIP-341 adresi
+        "sk_hex": seed_sk.hex(),
+        "xonly_pk": xonly_pk.hex(),
+        "address": address,
         "network": req.network,
         "bip341": True,
-        "hd": True,                   # HD-derived: signing'de child türet
+        "hd": True,
     }
+    _generate_wallet_addresses(wallet)
     wallets.append(wallet)
     _save_wallets()
 
-    # Bitcoin Core v26+ entegrasyonu: descriptor olarak kaydet
-    core_import_result = None
-    if _core_rpc:
-        import time as _time
-        try:
-            core_import_result = DescriptorWallet.import_taproot_key(
-                rpc=_core_rpc,
-                xonly_hex=xonly_pk.hex(),
-                label=req.label,
-                # Yeni üretilen anahtar → şu anki zaman.
-                # timestamp=0 genesis'ten tarar, mainnet'te saatler sürer.
-                # Geçmişte alınmış işlemleri görmek için eski tarih ver.
-                timestamp=int(_time.time()),
-            )
-        except LegacyMethodError as e:
-            # Bu branch teorik — import_taproot_key zaten importdescriptors kullanır
-            core_import_result = {"error": str(e)}
-        except Exception as e:
-            core_import_result = {"warning": f"Core import başarısız: {e}"}
-
     result = wallet_public(wallet)
-    if core_import_result:
-        result["core_import"] = core_import_result
+    if _core_rpc:
+        result["core_import"] = _core_import_hd_wallet(wallet)
     return result
 
 
@@ -765,9 +841,14 @@ def import_wallet(req: WalletImport):
         "hd":               True,
         "hd_imported":      True,
     }
+    _generate_wallet_addresses(wallet)
     wallets.append(wallet)
     _save_wallets()
-    return wallet_public(wallet)
+
+    result = wallet_public(wallet)
+    if _core_rpc:
+        result["core_import"] = _core_import_hd_wallet(wallet)
+    return result
 
 
 @app.post("/api/wallet/{wallet_id}/hd-scan")
@@ -851,6 +932,88 @@ def hd_scan(wallet_id: str, gap_limit: int = 20):
         "total_balance_sat": sum(e["balance_sat"] for e in found),
         "active_count": sum(1 for e in found if e["balance_sat"] > 0),
     }
+
+
+@app.post("/api/wallet/{wallet_id}/generate-addresses")
+def generate_addresses(wallet_id: str, n: int = 20):
+    """
+    Var olan cüzdan için receive + change adreslerini (yeniden) türetir.
+    Eski cüzdanlar veya manuel tetikleme için kullanılır.
+    """
+    w = next((x for x in wallets if x["id"] == wallet_id), None)
+    if not w:
+        raise HTTPException(404, "Cüzdan bulunamadı")
+    if not w.get("hd"):
+        raise HTTPException(400, "Yalnızca HD cüzdanlar için adres türetilebilir")
+    _generate_wallet_addresses(w, n=n)
+    _save_wallets()
+    return {
+        "receive_count": len(w["hd_addresses"]),
+        "change_count":  len(w["hd_change_addresses"]),
+    }
+
+
+@app.get("/api/wallet/{wallet_id}/addresses")
+def wallet_addresses(wallet_id: str):
+    """
+    Cüzdanın önceden türetilmiş receive ve change adreslerini döner.
+    hd_addresses (change=0) ve hd_change_addresses (change=1) kullanılır.
+    """
+    w = next((x for x in wallets if x["id"] == wallet_id), None)
+    if not w:
+        raise HTTPException(404, "Cüzdan bulunamadı")
+
+    def _to_list(addr_dict: Dict) -> list:
+        return [
+            {"index": int(idx), **info}
+            for idx, info in sorted(addr_dict.items(), key=lambda x: int(x[0]))
+        ]
+
+    return {
+        "wallet_id": wallet_id,
+        "label": w.get("label"),
+        "receive": _to_list(w.get("hd_addresses", {})),
+        "change":  _to_list(w.get("hd_change_addresses", {})),
+    }
+
+
+@app.get("/api/wallet/{wallet_id}/fresh-address")
+def fresh_address(wallet_id: str):
+    """
+    BIP-44/86 'fresh address' — daha önce hiç işlem görmemiş ilk receive adresini döner.
+    Esplora üzerinden funded_txo_count == 0 (confirmed + mempool) kontrolü yapılır.
+    Tüm adresler kullanılmışsa en yüksek index döner (all_used=true).
+    """
+    import urllib.request as _req, json as _json
+
+    w = next((x for x in wallets if x["id"] == wallet_id), None)
+    if not w:
+        raise HTTPException(404, "Cüzdan bulunamadı")
+
+    hd_addrs = w.get("hd_addresses", {})
+    if not hd_addrs:
+        return {"address": w["address"], "index": 0, "all_used": False}
+
+    base = esplora_base(w["network"])
+    sorted_entries = sorted(hd_addrs.items(), key=lambda x: int(x[0]))
+
+    for idx_str, info in sorted_entries:
+        addr = info["address"]
+        try:
+            url = f"{base}/address/{addr}"
+            with _req.urlopen(url, timeout=8) as r:
+                data = _json.loads(r.read())
+            funded_chain   = data.get("chain_stats",   {}).get("funded_txo_count", 0)
+            funded_mempool = data.get("mempool_stats", {}).get("funded_txo_count", 0)
+            if funded_chain == 0 and funded_mempool == 0:
+                return {"address": addr, "index": int(idx_str), "all_used": False}
+        except Exception:
+            # Ağ hatası → bu adresi taze kabul et
+            return {"address": addr, "index": int(idx_str), "all_used": False}
+
+    # Tüm adresler kullanılmış — son adresi döndür
+    last_idx, last_info = sorted_entries[-1]
+    return {"address": last_info["address"], "index": int(last_idx), "all_used": True}
 
 
 @app.get("/api/wallet/export")
@@ -976,7 +1139,14 @@ def get_balance(address: str):
     else:
         network = "mainnet"
 
-    mgr = get_utxo_manager(network)
+    # Adres cüzdan listesinde YOK — Core'a import edilmemiş (MuSig2, dağıtık oturum vb.)
+    # listunspent boş döner çünkü Core bu adresi izlemiyor.
+    # Bu durumda Core'u bypass edip Esplora kullan.
+    if not w and _core_rpc:
+        mgr = UTXOManager(network=network, rpc=None)
+    else:
+        mgr = get_utxo_manager(network)
+
     try:
         core_utxos = mgr.fetch_utxos(address)
         confirmed   = sum(u.value_sat for u in core_utxos if u.confirmations >= 1)
@@ -986,7 +1156,7 @@ def get_balance(address: str):
             "unconfirmed_sat": unconfirmed,
             "total_sat": confirmed + unconfirmed,
             "utxo_count": len(core_utxos),
-            "source": "core_rpc" if _core_rpc else "esplora",
+            "source": "core_rpc" if (w and _core_rpc) else "esplora",
         }
     except Exception as e:
         raise HTTPException(502, f"Bakiye sorgusu başarısız: {e}")
@@ -996,7 +1166,11 @@ def get_balance(address: str):
 def get_wallet_utxos(address: str):
     w, _ = find_wallet_for_address(address)
     network = w["network"] if w else "testnet4"
-    mgr = get_utxo_manager(network)
+    # Adres cüzdan listesinde yoksa (MuSig2 vb.) Esplora kullan
+    if not w and _core_rpc:
+        mgr = UTXOManager(network=network, rpc=None)
+    else:
+        mgr = get_utxo_manager(network)
     try:
         core_utxos = mgr.fetch_utxos(address)
         return [
@@ -1357,36 +1531,42 @@ def core_status():
 @app.post("/api/core/import-wallet")
 def core_import_wallet(data: dict):
     """
-    Mevcut cüzdanı Bitcoin Core'a descriptor olarak aktar.
-
-    importprivkey yerine importdescriptors (v26+ zorunlu).
-
-    Body: {"xonly_hex": "64-char-hex", "label": "...", "timestamp": 0}
+    Tek cüzdanı Bitcoin Core'a BIP-86 range descriptor ile aktar.
+    Body: {"wallet_id": "abc123"}  veya  {"address": "tb1p..."}
     """
     if not _core_rpc:
         raise HTTPException(503, "Bitcoin Core RPC bağlı değil")
 
-    xonly_hex = data.get("xonly_hex", "")
-    label     = data.get("label", "")
-    timestamp = data.get("timestamp", 0)
+    wid  = data.get("wallet_id")
+    addr = data.get("address")
+    w = None
+    if wid:
+        w = next((x for x in wallets if x["id"] == wid), None)
+    elif addr:
+        w, _ = find_wallet_for_address(addr)
+    if not w:
+        raise HTTPException(404, "Cüzdan bulunamadı")
 
-    try:
-        results = DescriptorWallet.import_taproot_key(
-            rpc=_core_rpc,
-            xonly_hex=xonly_hex,
-            label=label,
-            timestamp=timestamp,
-        )
-        descriptor = DescriptorWallet.taproot_key_path(xonly_hex)
-        return {
-            "success": True,
-            "descriptor": descriptor,
-            "results": results,
-        }
-    except LegacyMethodError as e:
-        raise HTTPException(400, f"Legacy metod hatası: {e.message}")
-    except Exception as e:
-        raise HTTPException(400, str(e))
+    result = _core_import_hd_wallet(w)
+    if "warning" in result:
+        raise HTTPException(400, result["warning"])
+    return result
+
+
+@app.post("/api/core/import-all-wallets")
+def core_import_all_wallets():
+    """Tüm kayıtlı HD cüzdanları Bitcoin Core'a toplu import eder."""
+    if not _core_rpc:
+        raise HTTPException(503, "Bitcoin Core RPC bağlı değil")
+
+    results = []
+    for w in wallets:
+        if not w.get("hd"):
+            continue
+        r = _core_import_hd_wallet(w)
+        results.append({"id": w["id"], "label": w["label"], **r})
+
+    return {"imported": len(results), "results": results}
 
 
 @app.get("/api/core/fee-estimate")
@@ -1434,6 +1614,7 @@ def create_musig2_session(req: MusigCreate):
         "participants": participants,
         "pk_list": [p["pk_hex"] for p in participants],
         "agg_xonly": _xonly(Q).hex(),
+        "agg_q_even_y": (Q.y % 2 == 0),
         "agg_address": agg_address,
         "agg_nonce": None,
         "final_sig": None,
@@ -1536,6 +1717,19 @@ def musig2_sign(sid: str, req: MusigPartialSign):
     pk_list_bytes = sorted([bytes.fromhex(pk) for pk in s["pk_list"]])
     Q, _ = key_aggregation(pk_list_bytes)
 
+    # Tutarsızlık tespiti: depolanmış agg_xonly ile şu an hesaplanan Q.x eşleşmeli.
+    # Eşleşmiyorsa session farklı bir key_aggregation versiyonuyla yaratılmış demektir
+    # (örn. BIP-327 uyum düzeltmesi öncesi). O adrese gönderilen UTXO harcanamaz.
+    computed_xonly = _xonly(Q).hex()
+    if computed_xonly != s["agg_xonly"]:
+        raise HTTPException(
+            409,
+            f"Session uyumsuzluğu: bu oturum farklı bir key_aggregation algoritmasıyla "
+            f"oluşturuldu. Depolanmış agg_xonly={s['agg_xonly'][:16]}… ile "
+            f"hesaplanan Q.x={computed_xonly[:16]}… eşleşmiyor. "
+            f"Lütfen yeni bir MuSig2 oturumu başlatın."
+        )
+
     all_sigs = []
     for idx in range(len(inputs)):
         sighash = taproot_sighash(inputs, outputs, idx)
@@ -1605,6 +1799,15 @@ def musig2_broadcast(sid: str):
         raise HTTPException(400, f"Yayınlama başarısız: {err}")
     except Exception as e:
         raise HTTPException(500, f"Bağlantı hatası: {e}")
+
+
+@app.delete("/api/musig2/{sid}")
+def delete_musig2_session(sid: str):
+    if sid not in musig2_sessions:
+        raise HTTPException(404, "Oturum bulunamadı")
+    del musig2_sessions[sid]
+    _save_musig2()
+    return {"ok": True}
 
 
 @app.get("/api/musig2/{sid}/utxos")
@@ -1867,18 +2070,15 @@ def dmusig2_build_tx(sid: str, req: DMusig2BuildTx):
         raise HTTPException(400, "MuSig2 adresinde onaylanmış UTXO yok")
 
     total_needed = req.amount_sat + req.fee_sat
-    confirmed.sort(key=lambda u: u["value"])
 
-    selected_utxos, total_in = [], 0
-    for u in confirmed:
-        selected_utxos.append(u)
-        total_in += u["value"]
-        if total_in >= total_needed:
-            break
+    # Dağıtık MuSig2: TÜM onaylı UTXO'ları kullan (UTXO konsolidasyonu).
+    # "En küçük önce" seçimi bazen tam eşleşen UTXO bulur → change=0 görünür.
+    # Tüm UTXO'lar seçilince gerçek para üstü hesaplanır ve agg adrese iade edilir.
+    selected_utxos = confirmed
+    total_in = sum(u["value"] for u in confirmed)
 
     if total_in < total_needed:
-        avail = sum(u["value"] for u in confirmed)
-        raise HTTPException(400, f"Yetersiz bakiye: {avail} sat, gerekli: {total_needed} sat")
+        raise HTTPException(400, f"Yetersiz bakiye: {total_in} sat, gerekli: {total_needed} sat")
 
     try:
         recipient_spk = address_to_scriptpubkey(req.to_address)

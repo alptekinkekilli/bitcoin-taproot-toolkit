@@ -51,34 +51,55 @@ from dataclasses import dataclass, field
 
 # ── Port ve Dizin Sabitleri ────────────────────────────────────────────────────
 
+def _find_cookie(candidates: list) -> str:
+    """Verilen yollardan var olan ilk .cookie dosyasını döner, yoksa ilk yolu döner."""
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return candidates[0]
+
+# Snap kurulumu: ~/snap/bitcoin-core/common/.bitcoin/
+_SNAP_BASE = os.path.expanduser("~/snap/bitcoin-core/common/.bitcoin")
+
 NETWORK_CONFIG = {
     "mainnet": {
         "rpc_port": 8332,
         "p2p_port": 8333,
-        "cookie_path": os.path.expanduser("~/.bitcoin/.cookie"),
+        "cookie_path": _find_cookie([
+            os.path.expanduser("~/.bitcoin/.cookie"),
+            os.path.join(_SNAP_BASE, ".cookie"),
+        ]),
         "chain": "main",
         "hrp": "bc",
     },
     "testnet": {
         "rpc_port": 18332,
         "p2p_port": 18333,
-        "cookie_path": os.path.expanduser("~/.bitcoin/testnet3/.cookie"),
+        "cookie_path": _find_cookie([
+            os.path.expanduser("~/.bitcoin/testnet3/.cookie"),
+            os.path.join(_SNAP_BASE, "testnet3", ".cookie"),
+        ]),
         "chain": "test",
         "hrp": "tb",
     },
     "testnet4": {
         # BIP-94 — v26.0+ ile gelen yeni testnet
-        # Testnet3'teki "block storm" saldırısını önlemek için tasarlandı
         "rpc_port": 48332,
         "p2p_port": 48333,
-        "cookie_path": os.path.expanduser("~/.bitcoin/testnet4/.cookie"),
+        "cookie_path": _find_cookie([
+            os.path.expanduser("~/.bitcoin/testnet4/.cookie"),
+            os.path.join(_SNAP_BASE, "testnet4", ".cookie"),
+        ]),
         "chain": "testnet4",
         "hrp": "tb",
     },
     "regtest": {
         "rpc_port": 18443,
         "p2p_port": 18444,
-        "cookie_path": os.path.expanduser("~/.bitcoin/regtest/.cookie"),
+        "cookie_path": _find_cookie([
+            os.path.expanduser("~/.bitcoin/regtest/.cookie"),
+            os.path.join(_SNAP_BASE, "regtest", ".cookie"),
+        ]),
         "chain": "regtest",
         "hrp": "bcrt",
     },
@@ -178,6 +199,7 @@ class CoreConnector:
         rpchost: str = "127.0.0.1",
         rpcport: Optional[int] = None,
         wallet_name: Optional[str] = None,
+        cookie_path: Optional[str] = None,
         timeout_sec: int = 15,
     ):
         if network not in NETWORK_CONFIG:
@@ -190,8 +212,18 @@ class CoreConnector:
         self.wallet_name = wallet_name
         self.timeout_sec = timeout_sec
         self._request_id = 0
+        # Cookie path: parametre > env > network default
+        self._cookie_path = (
+            cookie_path
+            or os.environ.get("BITCOIN_COOKIE_PATH")
+            or self.config["cookie_path"]
+        )
 
-        # Kimlik doğrulama — cookie dosyası öncelikli
+        # Kimlik doğrulama öncelik sırası:
+        #   1. rpcuser + rpcpassword (env veya parametre)
+        #   2. .cookie dosyası (localhost için otomatik)
+        # Uzak IP kullanıldığında (rpchost != 127.0.0.1) cookie erişilemez;
+        # bitcoin.conf'da rpcuser/rpcpassword tanımlanmalıdır.
         if rpcuser and rpcpassword:
             self._auth = (rpcuser, rpcpassword)
         else:
@@ -207,29 +239,46 @@ class CoreConnector:
         Her düğüm başlangıcında yenilenir.
         Güvenlik: Dosya izinleri sadece bitcoin kullanıcısına açık olmalı.
 
+        Uzak IP (rpchost != 127.0.0.1) kullanılıyorsa .cookie erişilemez;
+        bu durumda BITCOIN_RPCUSER + BITCOIN_RPCPASSWORD env değişkenleri
+        veya bitcoin.conf'daki rpcuser/rpcpassword kullanılmalıdır.
+
         Döner:
             (username, password) — tipik olarak ("__cookie__", "<hex>")
         """
-        cookie_path = self.config["cookie_path"]
-        if os.path.exists(cookie_path):
-            with open(cookie_path, "r") as f:
+        if os.path.exists(self._cookie_path):
+            with open(self._cookie_path, "r") as f:
                 content = f.read().strip()
             user, pw = content.split(":", 1)
             return (user, pw)
 
         # Fallback: ortam değişkenleri
-        user = os.environ.get("BITCOIN_RPCUSER", "bitcoin")
+        user = os.environ.get("BITCOIN_RPCUSER", "")
         pw   = os.environ.get("BITCOIN_RPCPASSWORD", "")
-        if pw:
+        if user and pw:
             return (user, pw)
 
+        is_remote = self.rpchost not in ("127.0.0.1", "localhost", "::1")
+        if is_remote:
+            raise RPCConnectionError(
+                f"Uzak Bitcoin Core için kimlik bilgisi gerekli.\n"
+                f"  Host: {self.rpchost}:{self.rpcport}\n"
+                f"  Çözüm: bitcoin.conf dosyasına ekle:\n"
+                f"    rpcuser=kullanici\n"
+                f"    rpcpassword=sifre\n"
+                f"    rpcallowip={self.rpchost}/32\n"
+                f"    rpcbind=0.0.0.0\n"
+                f"  Sonra .env dosyasına:\n"
+                f"    BITCOIN_RPCUSER=kullanici\n"
+                f"    BITCOIN_RPCPASSWORD=sifre"
+            )
         raise RPCConnectionError(
             f"RPC kimlik bilgisi bulunamadı.\n"
-            f"  Cookie: {cookie_path}\n"
+            f"  Cookie: {self._cookie_path}\n"
             f"  Seçenekler:\n"
             f"    1. Bitcoin Core'u başlat (cookie otomatik oluşur)\n"
-            f"    2. CoreConnector(rpcuser='...', rpcpassword='...')\n"
-            f"    3. BITCOIN_RPCUSER / BITCOIN_RPCPASSWORD ortam değişkeni"
+            f"    2. .env dosyasına: BITCOIN_RPCUSER=... BITCOIN_RPCPASSWORD=...\n"
+            f"    3. bitcoin.conf: rpcuser=... rpcpassword=..."
         )
 
     # ── HTTP JSON-RPC Çekirdeği ───────────────────────────────────────────────

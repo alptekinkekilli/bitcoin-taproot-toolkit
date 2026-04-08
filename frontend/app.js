@@ -60,6 +60,7 @@ function showTab(name) {
   document.querySelector(`[data-tab="${name}"]`).classList.add('active');
 
   if (name === 'dashboard') refreshDashboard();
+  if (name === 'addresses') loadAddresses();
   if (name === 'transactions') {
     txShowTab(txState.tab || 'wallets');
   }
@@ -139,7 +140,7 @@ async function loadAll() {
   // dMusig2 session'larını yükle
   get('/api/musig2d/list').then(all => {
     state.dmusig2SessionsAll = all;  // TX geçmişi için tümü
-    state.dmusig2Sessions = all.filter(s => s.state !== 'BROADCAST' && s.state !== 'SIGNED');
+    state.dmusig2Sessions = all.filter(s => s.state !== 'BROADCAST');
     populateWalletSelects();
   }).catch(() => {});
 }
@@ -375,15 +376,31 @@ async function loadRecentTxs() {
 
 // ── Receive ───────────────────────────────────────────────────────────────────
 
-function updateReceive() {
-  const address = document.getElementById('receiveWalletSelect').value;
+async function updateReceive() {
+  const walletId = document.getElementById('receiveWalletSelect').value;
   const addrEl = document.getElementById('receiveAddress');
   const qrWrap = document.getElementById('qrWrap');
   qrWrap.innerHTML = '';
 
-  if (!address) {
+  if (!walletId) {
     addrEl.innerHTML = '<span class="placeholder">Cüzdan seçin</span>';
+    document.getElementById('receiveBalance').innerHTML = '';
     return;
+  }
+
+  const w = state.wallets.find(x => x.id === walletId);
+  let address = w ? w.address : '';
+
+  // HD cüzdanlarda fresh address kullan (BIP-44/86 adres yeniden kullanımını önler)
+  if (w && w.hd && w.hd_addresses && Object.keys(w.hd_addresses).length > 0) {
+    addrEl.innerHTML = '<span class="placeholder">⏳ Taze adres aranıyor…</span>';
+    try {
+      const fresh = await get(`/api/wallet/${walletId}/fresh-address`);
+      address = fresh.address;
+      if (fresh.all_used) {
+        toast('Tüm adresler kullanılmış — son adres gösteriliyor', 'warning');
+      }
+    } catch { /* fallback to primary */ }
   }
 
   addrEl.textContent = address;
@@ -402,21 +419,102 @@ function updateReceive() {
 
 function copyReceiveAddress() {
   const addr = document.getElementById('receiveAddress').textContent;
-  if (addr && addr !== 'Cüzdan seçin') {
+  if (addr && addr !== 'Cüzdan seçin' && !addr.includes('⏳')) {
     copyToClipboard(addr);
     toast('Adres kopyalandı', 'success');
   }
 }
 
 async function refreshReceive() {
-  const address = document.getElementById('receiveWalletSelect').value;
-  if (!address) return;
+  // Gösterilen adresten bakiye çek (select value artık wallet ID)
+  const addr = document.getElementById('receiveAddress').textContent.trim();
+  if (!addr || addr.startsWith('Cüzdan') || addr.startsWith('⏳')) return;
   try {
-    const b = await get(`/api/wallet/${address}/balance`);
+    const b = await get(`/api/wallet/${addr}/balance`);
     document.getElementById('receiveBalance').innerHTML =
       `<span class="orange bold">${b.total_sat.toLocaleString()} sat</span>
        <span class="muted"> — ${b.utxo_count} UTXO</span>`;
   } catch {}
+}
+
+// ── Addresses Tab ─────────────────────────────────────────────────────────────
+
+async function loadAddresses() {
+  const walletId = document.getElementById('addrWalletSelect').value;
+  const content  = document.getElementById('addrTabContent');
+  if (!walletId) {
+    content.innerHTML = '<div style="color:var(--text-3);padding:24px 0;text-align:center">Cüzdan seçin</div>';
+    return;
+  }
+
+  content.innerHTML = '<div style="color:var(--text-3);padding:24px 0;text-align:center">⏳ Adresler yükleniyor…</div>';
+  try {
+    const data = await get(`/api/wallet/${walletId}/addresses`);
+    if (!data.receive.length && !data.change.length) {
+      content.innerHTML = `
+        <div style="color:var(--text-3);padding:24px;text-align:center">
+          Bu cüzdan için adres türetilmemiş.
+          <br><br>
+          <button class="btn btn-primary" onclick="generateAddresses('${walletId}')">Adres Türet (20×2)</button>
+        </div>`;
+      return;
+    }
+    renderAddressesTab(data);
+  } catch (e) {
+    content.innerHTML = `<div style="color:var(--red);padding:16px">Hata: ${e.message}</div>`;
+  }
+}
+
+async function generateAddresses(walletId) {
+  try {
+    await post(`/api/wallet/${walletId}/generate-addresses`, {});
+    toast('Adresler türetildi', 'success');
+    // Wallets listesini güncelle (hd_addresses içermesi için)
+    state.wallets = await get('/api/wallet/list');
+    loadAddresses();
+  } catch (e) {
+    toast(`Hata: ${e.message}`, 'error');
+  }
+}
+
+function renderAddressesTab(data) {
+  const content = document.getElementById('addrTabContent');
+
+  function addrTable(title, rows, isChange) {
+    let html = `
+      <div class="section-header" style="margin-top:${isChange ? '24px' : '0'}">
+        <h2>${title}</h2>
+        <span class="muted" style="font-size:13px">${rows.length} adres</span>
+      </div>
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead><tr>
+            <th>#</th><th>Adres</th><th>Bakiye</th><th>UTXO</th><th></th>
+          </tr></thead>
+          <tbody>`;
+    rows.forEach(r => {
+      const used  = r.balance_sat > 0 || r.utxo_count > 0;
+      const style = used ? 'color:var(--orange)' : '';
+      const shortAddr = r.address.substring(0, 20) + '…' + r.address.slice(-8);
+      const balText = r.balance_sat > 0 ? `${r.balance_sat.toLocaleString()} sat` : '<span class="muted">0</span>';
+      html += `<tr>
+        <td style="${style}">${r.index}</td>
+        <td style="font-family:monospace;font-size:12px;${style}" title="${r.address}">${shortAddr}</td>
+        <td>${balText}</td>
+        <td>${r.utxo_count || '<span class="muted">0</span>'}</td>
+        <td><button class="btn btn-ghost sm" onclick="copyToClipboard('${r.address}');toast('Kopyalandı','success')" title="Kopyala">⎘</button></td>
+      </tr>`;
+    });
+    if (!rows.length) {
+      html += `<tr><td colspan="5" class="empty">Adres yok — cüzdan yeni oluşturulmuşsa yeniden oluşturun</td></tr>`;
+    }
+    html += '</tbody></table></div>';
+    return html;
+  }
+
+  content.innerHTML =
+    addrTable('Receive Adresleri (m/86\'/…/0/*)', data.receive || [], false) +
+    addrTable('Change Adresleri (m/86\'/…/1/*)',  data.change  || [], true);
 }
 
 // ── Send ──────────────────────────────────────────────────────────────────────
@@ -988,7 +1086,7 @@ async function txdm2Load() {
     txState.dm2Sessions = await get('/api/musig2d/list');
     // state.dmusig2SessionsAll'ı da güncelle (tutarlılık için)
     state.dmusig2SessionsAll = txState.dm2Sessions;
-    state.dmusig2Sessions = txState.dm2Sessions.filter(s => s.state !== 'BROADCAST' && s.state !== 'SIGNED');
+    state.dmusig2Sessions = txState.dm2Sessions.filter(s => s.state !== 'BROADCAST');
   } catch { txState.dm2Sessions = []; }
   txState.dm2Page = 1;
   txdm2Render();
@@ -1000,7 +1098,7 @@ function txdm2Render() {
   const minAmt = parseInt(document.getElementById('txdm2Min')?.value) || 0;
   const maxAmt = parseInt(document.getElementById('txdm2Max')?.value) || Infinity;
   const status = document.getElementById('txdm2Status')?.value || '';
-  const DONE   = new Set(['BROADCAST', 'SIGNED']);
+  const DONE   = new Set(['BROADCAST']);
 
   let filtered = txState.dm2Sessions.filter(s => {
     if (net && s.network !== net) return false;
@@ -1168,6 +1266,7 @@ function renderMusig2List() {
           ` : ''}
           <button class="btn btn-ghost sm" onclick="copyAddr('${s.agg_address}')">⎘ Adres Kopyala</button>
           <a class="btn btn-ghost sm" href="https://mempool.space/testnet4/address/${s.agg_address}" target="_blank">↗ Explorer</a>
+          <button class="btn btn-ghost sm" style="color:#e05252;margin-left:auto" onclick="deleteMusig2Session('${s.id}')" title="Oturumu sil">✕ Sil</button>
         </div>
 
         ${s.state === 'SIGNED' && s.tx_hex ? `
@@ -1179,6 +1278,17 @@ function renderMusig2List() {
       </div>
     </div>`;
   }).join('');
+}
+
+async function deleteMusig2Session(sid) {
+  if (!confirm('Bu MuSig2 oturumu silinsin mi? Henüz harcanmamış UTXO varsa adresi not alın.')) return;
+  try {
+    await fetch(`/api/musig2/${sid}`, { method: 'DELETE' });
+    toast('Oturum silindi', 'success');
+    await loadMusig2();
+  } catch (e) {
+    toast(e.message, 'error');
+  }
 }
 
 async function resetMusig2Nonces(sid) {
@@ -1508,13 +1618,25 @@ async function createMusig2Session() {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function populateWalletSelects() {
-  // receiveWalletSelect — sadece birincil adresler
+  // addrWalletSelect — Adresler sekmesi için
+  const addrEl = document.getElementById('addrWalletSelect');
+  if (addrEl) {
+    const cur = addrEl.value;
+    let opts = '<option value="">— Cüzdan seçin —</option>';
+    state.wallets.forEach(w => {
+      opts += `<option value="${w.id}">${w.label}</option>`;
+    });
+    addrEl.innerHTML = opts;
+    if (cur) addrEl.value = cur;
+  }
+
+  // receiveWalletSelect — wallet ID kullanır; fresh address async olarak çekilir
   const recvEl = document.getElementById('receiveWalletSelect');
   if (recvEl) {
     const cur = recvEl.value;
     let opts = '<option value="">— Cüzdan seçin —</option>';
     state.wallets.forEach(w => {
-      opts += `<option value="${w.address}">${w.label} — ${w.address.substring(0, 16)}…</option>`;
+      opts += `<option value="${w.id}">${w.label}${w.hd ? '' : ` — ${w.address.substring(0, 14)}…`}</option>`;
     });
     recvEl.innerHTML = opts;
     if (cur) recvEl.value = cur;
@@ -1548,7 +1670,11 @@ function populateWalletSelects() {
 }
 
 function quickReceive(address) {
-  document.getElementById('receiveWalletSelect').value = address;
+  // address bir BTC adresi — wallet ID'ye çevir
+  const w = state.wallets.find(x => x.address === address ||
+    Object.values(x.hd_addresses || {}).some(a => a.address === address));
+  const id = w ? w.id : address;
+  document.getElementById('receiveWalletSelect').value = id;
   showTab('receive');
   updateReceive();
 }
@@ -1561,20 +1687,29 @@ function quickSend(address, utxoId) {
 }
 
 function copyToClipboard(text) {
+  // Secure context (HTTPS / localhost) → modern clipboard API
   if (navigator.clipboard && navigator.clipboard.writeText) {
-    return navigator.clipboard.writeText(text);
+    return navigator.clipboard.writeText(text).catch(() => _clipboardFallback(text));
   }
-  // HTTP (non-localhost) fallback: selection + clipboard write via input trick
-  const inp = document.createElement('input');
-  inp.value = text;
-  inp.style.cssText = 'position:fixed;opacity:0;top:0;left:0';
-  document.body.appendChild(inp);
-  inp.focus();
-  inp.select();
-  inp.setSelectionRange(0, text.length);
-  try { navigator.clipboard.writeText(text); } catch {}
-  document.body.removeChild(inp);
-  return Promise.resolve();
+  // HTTP / non-secure → execCommand fallback
+  return Promise.resolve(_clipboardFallback(text));
+}
+
+function _clipboardFallback(text) {
+  try {
+    const inp = document.createElement('textarea');
+    inp.value = text;
+    inp.style.cssText = 'position:fixed;opacity:0;top:0;left:0;width:1px;height:1px';
+    document.body.appendChild(inp);
+    inp.focus();
+    inp.select();
+    inp.setSelectionRange(0, text.length);
+    const ok = document.execCommand('copy');
+    document.body.removeChild(inp);
+    return ok;
+  } catch {
+    return false;
+  }
 }
 
 function copyAddr(addr) {
@@ -2030,7 +2165,7 @@ async function dArchiveLoad() {
   try {
     const all = await get('/api/musig2d/list');
     state.archiveSessions = all
-      .filter(s => s.state === 'BROADCAST' || s.state === 'SIGNED')
+      .filter(s => s.state === 'BROADCAST')
       .sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
     const badge = document.getElementById('dArchiveBadge');
     if (badge) badge.textContent = state.archiveSessions.length || '';
@@ -2360,13 +2495,32 @@ async function dLoadSessionList() {
     const sessions = await get('/api/musig2d/list');
     const el = document.getElementById('dmusig2SessionList');
 
-    // Arşiv badge'ini güncelle
-    const archived = sessions.filter(s => s.state === 'BROADCAST' || s.state === 'SIGNED');
+    // Arşiv badge'ini güncelle — yalnızca BROADCAST arşive gider
+    // SIGNED aktif kalır (broadcast aksiyonu bekliyor)
+    const archived = sessions.filter(s => s.state === 'BROADCAST');
     const badge = document.getElementById('dArchiveBadge');
     if (badge) badge.textContent = archived.length ? String(archived.length) : '';
 
-    // Aktif listede yalnızca tamamlanmamış session'lar
-    const active = sessions.filter(s => s.state !== 'BROADCAST' && s.state !== 'SIGNED');
+    // Aktif listede BROADCAST dışı her şey görünür (SIGNED dahil)
+    const active = sessions.filter(s => s.state !== 'BROADCAST');
+
+    // localStorage'dan myPubkey otomatik detect — sayfa yenilemede polling başlatmak için
+    if (!state.myPubkey) {
+      for (const s of sessions) {
+        const savedIdx = localStorage.getItem(D_IDX_KEY(s.id));
+        if (savedIdx !== null) {
+          const idx = parseInt(savedIdx);
+          const pk  = s.participants?.[idx]?.pubkey;
+          if (pk) {
+            state.myIndex  = idx;
+            state.myPubkey = pk;
+            state.myRole   = idx === 0 ? 'coordinator' : 'participant';
+            break;
+          }
+        }
+      }
+      if (state.myPubkey) { dStartPolling(); _dPollTick(); }
+    }
 
     // TX dropdown için state'i güncelle
     state.dmusig2Sessions = active;
@@ -2605,6 +2759,24 @@ function dRenderSession(s) {
   } else {
     idxSel.disabled = false;
     idxSel.title = '';
+    // Bekleyen katılımcıyı otomatik seç:
+    // COLLECTING_NONCES → nonce'ını henüz göndermemiş ilk katılımcı
+    // COLLECTING_SIGS   → imzasını henüz göndermemiş ilk katılımcı
+    // COLLECTING_PUBKEYS → pubkey'ini henüz kaydetmemiş ilk katılımcı
+    let autoIdx = 0;
+    if (s.state === 'COLLECTING_NONCES') {
+      const i = s.participants.findIndex(p =>
+        !p.pubnonces || p.pubnonces.length === 0 || p.pubnonces.every(n => n === null));
+      if (i >= 0) autoIdx = i;
+    } else if (s.state === 'COLLECTING_SIGS') {
+      const i = s.participants.findIndex(p =>
+        !p.partial_sigs || p.partial_sigs.length === 0 || p.partial_sigs.every(sig => sig === null));
+      if (i >= 0) autoIdx = i;
+    } else if (s.state === 'COLLECTING_PUBKEYS') {
+      const i = s.participants.findIndex(p => !p.pubkey);
+      if (i >= 0) autoIdx = i;
+    }
+    idxSel.value = String(autoIdx);
   }
 
   // Phase 1: Rol hesapla (kayıtlı index'e göre)
@@ -2622,6 +2794,63 @@ function dRenderSession(s) {
   if (state.myPubkey && !document.hidden) {
     dStartPolling();
   }
+
+  // ── Farklı tarayıcı uyarısı ───────────────────────────────────────────────
+  // Koşul: savedIdx yok + tüm pubkey'ler kayıtlı + nonce/sig aşaması
+  // ANCAK: bu tarayıcıda başka bir session'dan bilinen pubkey eşleşiyorsa meşru katılımcı.
+  // (Örnek: dQuickSession'da yeni session ID farklı olur, eski session'ın D_IDX_KEY'i kopyalanmaz)
+  const allPubkeysRegistered = s.participants.every(p => p.pubkey);
+  const sessionPubkeys = new Set(s.participants.map(p => p.pubkey).filter(Boolean));
+
+  // Bu tarayıcıda kayıtlı tüm pubkey'leri topla (tüm session'lardaki D_IDX_KEY'lerden)
+  const knownPubkeys = new Set();
+  let autoDetectedIdx = null;
+  for (let i = 0; i < localStorage.length; i++) {
+    const lsKey = localStorage.key(i);
+    if (!lsKey.startsWith('dmusig2_idx_')) continue;
+    const lsSid = lsKey.replace('dmusig2_idx_', '');
+    if (lsSid === s.id) continue;  // bu session zaten savedIdx=null → atla
+    const lsIdx = parseInt(localStorage.getItem(lsKey));
+    const oldSession = state.dmusig2SessionsAll?.find(x => x.id === lsSid);
+    const oldPk = oldSession?.participants?.[lsIdx]?.pubkey;
+    if (oldPk && sessionPubkeys.has(oldPk)) {
+      knownPubkeys.add(oldPk);
+      // Bu tarayıcı meşru katılımcı — index'ini de tespit et
+      const matchIdx = s.participants.findIndex(p => p.pubkey === oldPk);
+      if (matchIdx >= 0) autoDetectedIdx = matchIdx;
+    }
+  }
+
+  const isLegitimate = knownPubkeys.size > 0;  // Bu tarayıcı başka session'dan tanınan katılımcı
+  const isWrongBrowser = savedIdx === null && allPubkeysRegistered &&
+                         ['COLLECTING_NONCES', 'COLLECTING_SIGS'].includes(s.state) &&
+                         !isLegitimate;
+
+  // Meşru katılımcı tespit edildiyse D_IDX_KEY'i otomatik yaz ve dropdown'u kilitle
+  if (isLegitimate && savedIdx === null && autoDetectedIdx !== null) {
+    localStorage.setItem(D_IDX_KEY(s.id), String(autoDetectedIdx));
+    idxSel.value    = String(autoDetectedIdx);
+    idxSel.disabled = true;
+    idxSel.title    = 'Önceki oturumdan tanındı — katılımcı kimliği kilitli';
+    state.myIndex   = autoDetectedIdx;
+    state.myRole    = autoDetectedIdx === 0 ? 'coordinator' : 'participant';
+    state.myPubkey  = s.participants[autoDetectedIdx]?.pubkey || null;
+    if (state.myPubkey && !document.hidden) dStartPolling();
+    console.log(`[dMusig2] Meşru katılımcı otomatik tespit: idx=${autoDetectedIdx} pubkey=${state.myPubkey?.substring(0,16)}…`);
+  }
+
+  // Console log — sadece state değiştiğinde bas (polling tekrarında sustur)
+  if (isWrongBrowser !== state._wrongBrowser) {
+    console.log(`[dMusig2] WrongBrowser check | session=${s.id} state=${s.state}`, {
+      savedIdx, allPubkeysRegistered, isLegitimate,
+      knownPubkeys: [...knownPubkeys].map(p => p.substring(0,16) + '…'),
+      autoDetectedIdx, isWrongBrowser,
+    });
+  }
+
+  state._wrongBrowser = isWrongBrowser;
+  const wbWarning = document.getElementById('dmusig2WrongBrowserWarning');
+  if (wbWarning) wbWarning.style.display = isWrongBrowser ? '' : 'none';
 
   // Mevcut sk'yı yükle (şifreli yoksa) — kullanıcı input'a odaklanmışsa yazmayı atla
   const hasEncSk = !!localStorage.getItem(D_ENC_SK_KEY(s.id));
@@ -2896,6 +3125,7 @@ async function dSubmitNonce() {
   const skHex = document.getElementById('dmusig2MySkInput').value.trim();
   const idx   = parseInt(document.getElementById('dmusig2MyIndex').value);
   if (!s) { toast('Oturum yüklenmedi', 'error'); return; }
+  if (state._wrongBrowser) { toast('⛔ Farklı tarayıcı — nonce üretimi bu tarayıcıda mümkün değil', 'error'); return; }
   if (!skHex || skHex.length !== 64) { toast('Geçerli özel anahtar girin', 'error'); return; }
   if (!s.sighashes || !s.sighashes.length) { toast('Sighash yok — önce TX oluşturun', 'error'); return; }
 
@@ -2932,6 +3162,7 @@ async function dSubmitPartialSig() {
   const skHex = document.getElementById('dmusig2MySkInput').value.trim();
   const idx   = parseInt(document.getElementById('dmusig2MyIndex').value);
   if (!s) { toast('Oturum yüklenmedi', 'error'); return; }
+  if (state._wrongBrowser) { toast('⛔ Farklı tarayıcı — imzalama bu tarayıcıda mümkün değil', 'error'); return; }
   if (!skHex || skHex.length !== 64) { toast('Geçerli özel anahtar girin', 'error'); return; }
   if (s.state !== 'COLLECTING_SIGS') { toast('Henüz imzalama aşamasında değil', 'error'); return; }
 
