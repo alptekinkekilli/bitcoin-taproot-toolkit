@@ -127,15 +127,17 @@ if [[ "${USE_CORE_RPC:-false}" == "true" ]]; then
         echo -e "          Esplora fallback (mempool.space) kullanılacak."
     else
         # 2. RPC kimlik doğrulama + ağ uyumu kontrolü
-        _RPC_AUTH=""
-        [[ -n "$_USER" ]] && _RPC_AUTH="-u ${_USER}:${_PASS}"
+        # Bash dizisi — özel karakter içeren şifrelerde word-splitting/history expansion sorununu önler
+        _CURL_CREDS=()
+        [[ -n "$_USER" ]] && _CURL_CREDS=(--user "${_USER}:${_PASS}")
 
-        _RPC_RESULT=$(curl -s --max-time 5 $_RPC_AUTH \
+        _RPC_RESULT=$(curl -s --max-time 5 "${_CURL_CREDS[@]}" \
             -X POST -H "Content-Type: application/json" \
-            --data '{"jsonrpc":"1.1","method":"getblockchaininfo","params":[]}' \
+            --data '{"jsonrpc":"2.0","id":1,"method":"getblockchaininfo","params":[]}' \
             "http://${_HOST}:${_PORT}/" 2>/dev/null)
 
-        if echo "$_RPC_RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if 'result' in d and d['result'] else 1)" 2>/dev/null; then
+        # result null değil VE error yok → başarılı (jsonrpc 1.1 null result ile hata ayrımı)
+        if echo "$_RPC_RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if d.get('result') is not None and not d.get('error') else 1)" 2>/dev/null; then
             _CHAIN=$(echo "$_RPC_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['chain'])" 2>/dev/null)
             _PRUNED=$(echo "$_RPC_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['result'].get('pruned','false'))" 2>/dev/null)
 
@@ -153,11 +155,10 @@ if [[ "${USE_CORE_RPC:-false}" == "true" ]]; then
 
             # 3. Wallet varlık ve yüklenme kontrolü
             if [[ -n "$_WALLET" ]]; then
-                _WALLETS_URL="http://${_HOST}:${_PORT}/"
-                _WALLETS_RESULT=$(curl -s --max-time 5 $_RPC_AUTH \
+                _WALLETS_RESULT=$(curl -s --max-time 5 "${_CURL_CREDS[@]}" \
                     -X POST -H "Content-Type: application/json" \
-                    --data '{"jsonrpc":"1.1","method":"listwallets","params":[]}' \
-                    "$_WALLETS_URL" 2>/dev/null)
+                    --data '{"jsonrpc":"2.0","id":2,"method":"listwallets","params":[]}' \
+                    "http://${_HOST}:${_PORT}/" 2>/dev/null)
                 _WALLET_LOADED=$(echo "$_WALLETS_RESULT" | python3 -c \
                     "import sys,json; wl=json.load(sys.stdin).get('result',[]); print('yes' if '$_WALLET' in wl else 'no')" 2>/dev/null)
                 if [[ "$_WALLET_LOADED" != "yes" ]]; then
