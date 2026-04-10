@@ -94,6 +94,26 @@ if _USE_CORE:
         info = _core_rpc.health_check()
         logger.info("[Core] Bitcoin Core v26+ bağlandı: chain=%s blocks=%s progress=%.4f",
                     info['chain'], info['blocks'], info['verificationprogress'])
+
+        # Wallet varlık kontrolü — health_check getblockchaininfo kullanır (global RPC),
+        # bu yüzden wallet yüklü olmasa bile geçer. listunspent wallet-specific'tir ve
+        # wallet yüklü değilse -18 hatası fırlatır. Kullanıcıyı önceden uyar.
+        if _core_rpc.wallet_name:
+            try:
+                loaded_wallets = _core_rpc.list_wallets()
+                if _core_rpc.wallet_name not in loaded_wallets:
+                    logger.warning(
+                        "[Core] UYARI: '%s' wallet yüklü değil. "
+                        "listunspent başarısız olacak — scantxoutset/Esplora fallback devreye girecek.\n"
+                        "  Yüklü walletlar: %s\n"
+                        "  Çözüm: bitcoin-cli createwallet '%s' false true '' false true",
+                        _core_rpc.wallet_name, loaded_wallets, _core_rpc.wallet_name,
+                    )
+                else:
+                    logger.info("[Core] Wallet '%s' yüklü ✓", _core_rpc.wallet_name)
+            except RPCError as wallet_err:
+                logger.warning("[Core] Wallet kontrol hatası (listwallets): %s", wallet_err)
+
     except RPCConnectionError as e:
         logger.warning("[Core] Bağlantı kurulamadı, Esplora'ya geçildi: %s", e)
         _core_rpc = None
@@ -1139,13 +1159,10 @@ def get_balance(address: str):
     else:
         network = "mainnet"
 
-    # Adres cüzdan listesinde YOK — Core'a import edilmemiş (MuSig2, dağıtık oturum vb.)
-    # listunspent boş döner çünkü Core bu adresi izlemiyor.
-    # Bu durumda Core'u bypass edip Esplora kullan.
-    if not w and _core_rpc:
-        mgr = UTXOManager(network=network, rpc=None)
-    else:
-        mgr = get_utxo_manager(network)
+    # Her zaman Core üzerinden dene — wallet listesinde olmayan adresler (MuSig2, dağıtık oturum)
+    # için listunspent boş döner ama UTXOManager zaten scantxoutset → Esplora cascade'ini
+    # kendisi yönetir. scantxoutset wallet gerektirmez, tüm UTXO setini tarar.
+    mgr = get_utxo_manager(network)
 
     try:
         core_utxos = mgr.fetch_utxos(address)
@@ -1156,7 +1173,7 @@ def get_balance(address: str):
             "unconfirmed_sat": unconfirmed,
             "total_sat": confirmed + unconfirmed,
             "utxo_count": len(core_utxos),
-            "source": "core_rpc" if (w and _core_rpc) else "esplora",
+            "source": "core_rpc" if _core_rpc else "esplora",
         }
     except Exception as e:
         raise HTTPException(502, f"Bakiye sorgusu başarısız: {e}")
@@ -1166,11 +1183,8 @@ def get_balance(address: str):
 def get_wallet_utxos(address: str):
     w, _ = find_wallet_for_address(address)
     network = w["network"] if w else "testnet4"
-    # Adres cüzdan listesinde yoksa (MuSig2 vb.) Esplora kullan
-    if not w and _core_rpc:
-        mgr = UTXOManager(network=network, rpc=None)
-    else:
-        mgr = get_utxo_manager(network)
+    # Her zaman Core üzerinden dene — scantxoutset wallet gerektirmez
+    mgr = get_utxo_manager(network)
     try:
         core_utxos = mgr.fetch_utxos(address)
         return [
@@ -1429,14 +1443,26 @@ def build_transaction(req: TxRequest):
 @app.post("/api/tx/broadcast")
 def broadcast(req: BroadcastRequest):
     """
-    TX'i ağa yayınla. raw_tx.broadcast_tx yerine doğrudan Esplora kullanılır:
-    raw_tx modülü uvicorn tarafından import anında cache'lenir ve ESPLORA_TESTNET
-    sabitini o anki değeriyle kilitler. Ağ değişikliği sonrası reload tutarsızlık
-    yaratır. Burada esplora_base() ile her zaman doğru URL seçilir.
+    TX'i ağa yayınla.
+
+    Öncelik: Bitcoin Core sendrawtransaction → Esplora fallback.
+    Core bağlıysa doğrudan local node üzerinden yayınlar (daha hızlı, daha güvenilir).
+    Core bağlı değilse veya hata verirse Esplora (mempool.space) kullanılır.
     """
     import urllib.request as ur, urllib.error
 
-    # Ağı cüzdanlardan tespit et (yoksa testnet4)
+    # Önce Bitcoin Core dene
+    if _core_rpc:
+        try:
+            txid = _core_rpc.send_raw_transaction(req.tx_hex)
+            logger.info("[broadcast] Core sendrawtransaction başarılı: %s", txid)
+            return {"txid": txid, "source": "core_rpc"}
+        except RPCError as e:
+            logger.warning("[broadcast] Core sendrawtransaction başarısız (%s), Esplora fallback", e)
+        except Exception as e:
+            logger.warning("[broadcast] Core bağlantı hatası (%s), Esplora fallback", e)
+
+    # Esplora fallback
     networks = list({w["network"] for w in wallets}) if wallets else []
     network  = networks[0] if len(networks) == 1 else os.environ.get("BITCOIN_NETWORK", "testnet4")
     url      = esplora_base(network) + "/tx"
@@ -1446,8 +1472,9 @@ def broadcast(req: BroadcastRequest):
                           headers={"Content-Type": "text/plain"})
         with ur.urlopen(req2, timeout=15) as r:
             txid = r.read().decode()
-        return {"txid": txid}
-    except urllib.error.HTTPError as e:
+        logger.info("[broadcast] Esplora yayınlandı: %s", txid)
+        return {"txid": txid, "source": "esplora"}
+    except ur.HTTPError as e:
         err = e.read().decode()
         raise HTTPException(400, f"Yayınlama başarısız: {err}")
     except Exception as e:

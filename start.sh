@@ -113,6 +113,74 @@ echo -e "  Arayüz : ${BLUE}http://localhost:$PORT${NC}"
 echo -e "  API    : ${BLUE}http://localhost:$PORT/docs${NC}"
 echo ""
 
+# ── Bitcoin Core Ön Kontroller (USE_CORE_RPC=true ise) ───────────────────────
+if [[ "${USE_CORE_RPC:-false}" == "true" ]]; then
+    _HOST="${BITCOIN_RPCHOST:-127.0.0.1}"
+    _PORT="${BITCOIN_RPCPORT:-48332}"
+    _USER="${BITCOIN_RPCUSER:-}"
+    _PASS="${BITCOIN_RPCPASSWORD:-}"
+    _WALLET="${BITCOIN_WALLET:-}"
+
+    # 1. Port erişilebilirlik kontrolü
+    if ! nc -z -w2 "$_HOST" "$_PORT" 2>/dev/null; then
+        echo -e "${YELLOW}⚠  UYARI:${NC} Bitcoin Core $_HOST:$_PORT portunda erişilemiyor."
+        echo -e "          Esplora fallback (mempool.space) kullanılacak."
+    else
+        # 2. RPC kimlik doğrulama + ağ uyumu kontrolü
+        _RPC_AUTH=""
+        [[ -n "$_USER" ]] && _RPC_AUTH="-u ${_USER}:${_PASS}"
+
+        _RPC_RESULT=$(curl -s --max-time 5 $_RPC_AUTH \
+            -X POST -H "Content-Type: application/json" \
+            --data '{"jsonrpc":"1.1","method":"getblockchaininfo","params":[]}' \
+            "http://${_HOST}:${_PORT}/" 2>/dev/null)
+
+        if echo "$_RPC_RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); sys.exit(0 if 'result' in d and d['result'] else 1)" 2>/dev/null; then
+            _CHAIN=$(echo "$_RPC_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['result']['chain'])" 2>/dev/null)
+            _PRUNED=$(echo "$_RPC_RESULT" | python3 -c "import sys,json; print(json.load(sys.stdin)['result'].get('pruned','false'))" 2>/dev/null)
+
+            # 4. Ağ uyumu kontrolü
+            _EXPECTED_CHAIN=""
+            case "$NETWORK" in
+                mainnet)  _EXPECTED_CHAIN="main" ;;
+                testnet4) _EXPECTED_CHAIN="testnet4" ;;
+                testnet)  _EXPECTED_CHAIN="test" ;;
+            esac
+            if [[ -n "$_EXPECTED_CHAIN" && "$_CHAIN" != "$_EXPECTED_CHAIN" ]]; then
+                echo -e "${YELLOW}⚠  UYARI:${NC} Ağ uyumsuzluğu — Core '$_CHAIN' zincirinde çalışıyor, config '$NETWORK' diyor."
+                echo -e "          Doğru node'a bağlandığınızı kontrol edin."
+            fi
+
+            # 3. Wallet varlık ve yüklenme kontrolü
+            if [[ -n "$_WALLET" ]]; then
+                _WALLETS_URL="http://${_HOST}:${_PORT}/"
+                _WALLETS_RESULT=$(curl -s --max-time 5 $_RPC_AUTH \
+                    -X POST -H "Content-Type: application/json" \
+                    --data '{"jsonrpc":"1.1","method":"listwallets","params":[]}' \
+                    "$_WALLETS_URL" 2>/dev/null)
+                _WALLET_LOADED=$(echo "$_WALLETS_RESULT" | python3 -c \
+                    "import sys,json; wl=json.load(sys.stdin).get('result',[]); print('yes' if '$_WALLET' in wl else 'no')" 2>/dev/null)
+                if [[ "$_WALLET_LOADED" != "yes" ]]; then
+                    echo -e "${YELLOW}⚠  UYARI:${NC} '$_WALLET' wallet Bitcoin Core'da yüklü değil."
+                    echo -e "          listunspent başarısız olacak — scantxoutset/Esplora fallback devreye girecek."
+                    echo -e "          Çözüm: bitcoin-cli -rpcport=$_PORT createwallet '$_WALLET' false true '' false true"
+                fi
+            fi
+
+            # 5. Prune modu uyarısı
+            if [[ "$_PRUNED" == "True" || "$_PRUNED" == "true" ]]; then
+                echo -e "${CYAN}ℹ  Bilgi:${NC} Node pruned modda çalışıyor. scantxoutset desteklenir ancak yavaş olabilir."
+            fi
+
+        else
+            echo -e "${YELLOW}⚠  UYARI:${NC} Bitcoin Core RPC kimlik doğrulaması başarısız."
+            echo -e "          BITCOIN_RPCUSER / BITCOIN_RPCPASSWORD değerlerini kontrol edin."
+            echo -e "          Esplora fallback kullanılacak."
+        fi
+    fi
+    echo ""
+fi
+
 # ── Sunucu Başlat ─────────────────────────────────────────────────────────────
 cd "$BACKEND_DIR"
 exec uvicorn app:app \
