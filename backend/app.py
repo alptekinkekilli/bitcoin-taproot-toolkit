@@ -1206,6 +1206,7 @@ def get_wallet_utxos(address: str):
 
 @app.get("/api/wallet/{address}/txs")
 def get_wallet_txs(address: str):
+    # TX geçmişi: Core'da adres bazlı API yok (txindex=1 kapalı), Esplora zorunlu.
     import urllib.request, json
     w, _ = find_wallet_for_address(address)
     if not w:
